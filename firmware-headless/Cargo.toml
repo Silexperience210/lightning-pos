@@ -1,0 +1,19 @@
+[package]
+name = "firmware-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightningPoS firmware for Headless ESP32 Dev (12 channels, no display)"
+
+[features]
+default = ["board-headless"]
+board-headless = ["lightningpos-hal/board-headless"]
+
+[dependencies]
+lightningpos-core = { path = "../lightningpos-core" }
+lightningpos-hal = { path = "../lightningpos-hal", features = ["board-headless"] }
+lightningpos-net = { path = "../lightningpos-net" }
+embassy-executor.workspace = true
+embassy-time.workspace = true
+esp-hal.workspace = true
+log.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "lightningpos-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lightningpos-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+thiserror.workspace = true
+heapless.workspace = true
+
+# Network protocols
+embedded-io.workspace = true
+embedded-io-async.workspace = true
+
+# Async
+embassy-time.workspace = true
+embassy-sync.workspace = true
+embassy-futures.workspace = true

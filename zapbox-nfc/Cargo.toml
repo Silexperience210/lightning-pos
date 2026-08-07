@@ -1,0 +1,11 @@
+[package]
+name = "lightningpos-nfc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NFC module for LightningPoS (Bolt Card, PN532, NT3H2111)"
+
+[dependencies]
+lightningpos-core = { path = "../lightningpos-core" }
+log.workspace = true
+heapless.workspace = true

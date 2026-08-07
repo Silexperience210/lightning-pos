@@ -1,0 +1,19 @@
+[package]
+name = "firmware-c3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightningPoS firmware for ESP32-C3-DevKitM-1 (RISC-V, 1 relay + 2 flex)"
+
+[features]
+default = ["board-esp32c3"]
+board-esp32c3 = ["lightningpos-hal/board-esp32c3"]
+
+[dependencies]
+lightningpos-core = { path = "../lightningpos-core" }
+lightningpos-hal = { path = "../lightningpos-hal", features = ["board-esp32c3"] }
+lightningpos-net = { path = "../lightningpos-net" }
+embassy-executor.workspace = true
+embassy-time.workspace = true
+esp-hal.workspace = true
+log.workspace = true

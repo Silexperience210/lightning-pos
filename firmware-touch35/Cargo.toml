@@ -1,0 +1,20 @@
+[package]
+name = "firmware-touch35"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightningPoS firmware for Touch 3.5\" JC3248W535C (ESP32-S3, 6 flex channels)"
+
+[features]
+default = ["board-touch35"]
+board-touch35 = ["lightningpos-hal/board-touch35"]
+
+[dependencies]
+lightningpos-core = { path = "../lightningpos-core" }
+lightningpos-hal = { path = "../lightningpos-hal", features = ["board-touch35"] }
+lightningpos-net = { path = "../lightningpos-net" }
+embassy-executor.workspace = true
+embassy-time.workspace = true
+esp-hal.workspace = true
+log.workspace = true
+heapless.workspace = true

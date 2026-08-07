@@ -1,0 +1,38 @@
+[package]
+name = "lightningpos-firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LightningPoS firmware for LilyGo T-Display-S3 (ESP32-S3, 4 channels, display)"
+
+# ESP32-S3 target
+[features]
+default = ["board-tdisplay-s3"]
+board-tdisplay-s3 = ["lightningpos-hal/board-tdisplay-s3"]
+
+[dependencies]
+lightningpos-core = { path = "../lightningpos-core" }
+lightningpos-hal = { path = "../lightningpos-hal", features = ["board-tdisplay-s3"] }
+lightningpos-net = { path = "../lightningpos-net" }
+lightningpos-display = { path = "../lightningpos-display" }
+lightningpos-nfc = { path = "../lightningpos-nfc" }
+
+# Embassy async runtime
+embassy-executor.workspace = true
+embassy-time.workspace = true
+
+# Hardware
+esp-hal.workspace = true
+esp-println.workspace = true
+esp-wifi.workspace = true
+esp-storage.workspace = true
+
+# Logging
+log.workspace = true
+defmt.workspace = true
+defmt-rtt.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+heapless.workspace = true

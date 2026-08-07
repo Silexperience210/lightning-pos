@@ -1,0 +1,21 @@
+# Build artifacts
+target/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS nonsense
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+*.env.local
+
+# Firmware binaries
+*.bin
+*.elf
