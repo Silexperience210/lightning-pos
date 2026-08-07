@@ -48,7 +48,7 @@ heapless = "0.8"
 hash32 = "0.3"
 
 # Crypto & encoding
-bech32 = "0.11"
+bech32 = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

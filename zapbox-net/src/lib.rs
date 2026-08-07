@@ -13,6 +13,8 @@
 /// All network operations are async (embassy), allowing the firmware
 /// to handle WiFi, WebSocket, and display updates concurrently.
 
+extern crate alloc;
+
 pub mod api;
 pub mod websocket;
 pub mod wifi;

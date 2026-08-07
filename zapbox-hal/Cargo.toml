@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["board-tdisplay-s3"]
+board-tdisplay-s3 = []
+board-touch35 = []
+board-headless = []
+board-esp32c3 = []
+
 [dependencies]
 log.workspace = true
 defmt.workspace = true

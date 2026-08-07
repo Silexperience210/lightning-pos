@@ -30,6 +30,9 @@
 /// └─────────┘ └──────────┘ └─────────────┘
 /// ```
 
+// Needed for no_std + alloc environments (embedded)
+extern crate alloc;
+
 pub mod config;
 pub mod error;
 pub mod events;

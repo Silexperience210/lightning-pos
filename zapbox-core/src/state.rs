@@ -43,10 +43,10 @@
 /// safely shared between tasks via `embassy_sync::Signal` or a mutex.
 /// The `StateMachine` wrapper adds transition validation and timestamps.
 
-use defmt::Format;
+use core::fmt;
 
 /// All possible device operating states
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceState {
     /// Power-on, hardware init, config loading
     Initializing,
@@ -113,7 +113,7 @@ impl DeviceState {
 }
 
 /// WiFi connectivity state (orthogonal to DeviceState)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Format)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WifiState {
     Disconnected,
     Connecting,
