@@ -11,7 +11,7 @@ board-esp32c3 = ["lightningpos-hal/board-esp32c3"]
 
 [dependencies]
 lightningpos-core = { path = "../lightningpos-core" }
-lightningpos-hal = { path = "../lightningpos-hal", features = ["board-esp32c3"] }
+lightningpos-hal = { path = "../lightningpos-hal", default-features = false, features = ["board-esp32c3"] }
 lightningpos-net = { path = "../lightningpos-net" }
 embassy-executor.workspace = true
 embassy-time.workspace = true

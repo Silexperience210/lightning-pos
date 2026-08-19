@@ -11,7 +11,7 @@ board-headless = ["lightningpos-hal/board-headless"]
 
 [dependencies]
 lightningpos-core = { path = "../lightningpos-core" }
-lightningpos-hal = { path = "../lightningpos-hal", features = ["board-headless"] }
+lightningpos-hal = { path = "../lightningpos-hal", default-features = false, features = ["board-headless"] }
 lightningpos-net = { path = "../lightningpos-net" }
 embassy-executor.workspace = true
 embassy-time.workspace = true

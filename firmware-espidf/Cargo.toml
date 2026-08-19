@@ -1,0 +1,24 @@
+[package]
+name = "firmware-espidf"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+esp-idf-hal = "0.46"
+esp-idf-sys = { version = "0.37", features = ["binstart"] }
+esp-idf-svc = "0.52"
+log = "0.4"
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+heapless = "0.9"
+embedded-svc = "0.29"
+qrcodegen = "1.8"
+
+[build-dependencies]
+embuild = { version = "0.32", features = ["espidf"] }
+
+[profile.release]
+opt-level = "s"
+debug = true

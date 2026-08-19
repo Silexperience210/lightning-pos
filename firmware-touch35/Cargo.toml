@@ -11,10 +11,14 @@ board-touch35 = ["lightningpos-hal/board-touch35"]
 
 [dependencies]
 lightningpos-core = { path = "../lightningpos-core" }
-lightningpos-hal = { path = "../lightningpos-hal", features = ["board-touch35"] }
+lightningpos-hal = { path = "../lightningpos-hal", default-features = false, features = ["board-touch35"] }
 lightningpos-net = { path = "../lightningpos-net" }
+lightningpos-display = { path = "../lightningpos-display" }
 embassy-executor.workspace = true
 embassy-time.workspace = true
 esp-hal.workspace = true
+esp-hal-embassy.workspace = true
+esp-alloc.workspace = true
+esp-println.workspace = true
 log.workspace = true
 heapless.workspace = true

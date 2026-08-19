@@ -2,6 +2,12 @@
 target/
 dist/
 
+# ESP-IDF SDK téléchargé par esp-idf-sys (3+ Go — jamais commité)
+.embuild/
+
+# Artéfacts de build ESP
+esp_app_desc.x
+
 # IDE
 .vscode/
 .idea/

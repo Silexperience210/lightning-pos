@@ -1,0 +1,13 @@
+[build]
+target = "xtensa-esp32s3-espidf"
+
+[target.xtensa-esp32s3-espidf]
+runner = "espflash flash --port /dev/ttyACM0"
+linker = "ldproxy"
+rustflags = ["--cfg", "espidf_time64"]
+
+[env]
+ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults"
+
+[unstable]
+build-std = ["std", "panic_abort"]
