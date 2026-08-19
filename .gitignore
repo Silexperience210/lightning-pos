@@ -25,3 +25,7 @@ Thumbs.db
 # Firmware binaries
 *.bin
 *.elf
+
+# Virtualenvs (jamais versionnés)
+.venv/
+venv/
