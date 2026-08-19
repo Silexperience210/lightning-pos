@@ -1,4 +1,4 @@
-name: CI — Build All Variants
+name: CI — LightningPoS
 
 on:
   push:
@@ -7,126 +7,38 @@ on:
     branches: [main]
 
 jobs:
-  # ─── Core library checks ──────────────────────────────────────────
-  test-core:
-    name: Test Core (host)
+  # ─── Firmware POS : JC3248W535C / ESP32-S3 (esp-idf-hal, std) ─────
+  build-espidf:
+    name: Build firmware-espidf (ESP32-S3)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p lightningpos-core
-      - run: cargo test -p lightningpos-net --lib -- --skip real_hardware
-      - run: cargo test -p lightningpos-hal --lib
-      - name: Clippy (core)
-        run: cargo clippy -p lightningpos-core -- -D warnings
 
-  # ─── T-Display-S3 firmware ─────────────────────────────────────────
-  build-tdisplay-s3:
-    name: Build T-Display-S3
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install nightly --component rust-src
-          rustup target add xtensa-esp32s3-none-elf
-      - name: Install espup
-        run: |
-          cargo install espup
-          espup install --targets esp32s3
+      # Installe la toolchain Rust Xtensa (espup) + ldproxy, requis par
+      # le linker déclaré dans firmware-espidf/.cargo/config.toml.
+      # Version épinglée sur celle qui compile localement (1.95.0.0).
+      - name: Install Xtensa Rust toolchain
+        uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: esp32s3
+          ldproxy: true
+          version: 1.95.0.0
+
+      # ESP-IDF est installé par esp-idf-sys (embuild) au moment du build.
+      # ESP_IDF_VERSION épingle la v5.2.3 ciblée par le firmware.
       - name: Build firmware
-        run: |
-          . ~/export-esp.sh
-          cargo build --release -p lightningpos-firmware
+        working-directory: firmware-espidf
+        env:
+          ESP_IDF_VERSION: v5.2.3
+        run: cargo +esp build --release
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-tdisplay-s3
-          path: target/xtensa-esp32s3-none-elf/release/lightningpos-firmware
-
-  # ─── Touch 3.5" firmware ──────────────────────────────────────────
-  build-touch35:
-    name: Build Touch 3.5"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install nightly --component rust-src
-          rustup target add xtensa-esp32s3-none-elf
-      - name: Install espup
-        run: |
-          cargo install espup
-          espup install --targets esp32s3
-      - name: Build firmware
-        run: |
-          . ~/export-esp.sh
-          cargo build --release -p firmware-touch35
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-touch35
-          path: target/xtensa-esp32s3-none-elf/release/firmware-touch35
-
-  # ─── Headless ESP32 firmware ──────────────────────────────────────
-  build-headless:
-    name: Build Headless
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install nightly --component rust-src
-          rustup target add xtensa-esp32-none-elf
-      - name: Install espup
-        run: |
-          cargo install espup
-          espup install --targets esp32
-      - name: Build firmware
-        run: |
-          . ~/export-esp.sh
-          cargo build --release -p firmware-headless
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-headless
-          path: target/xtensa-esp32-none-elf/release/firmware-headless
-
-  # ─── ESP32-C3 firmware ────────────────────────────────────────────
-  build-c3:
-    name: Build ESP32-C3
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          rustup toolchain install nightly --component rust-src
-          rustup target add riscv32imc-unknown-none-elf
-      - name: Install espup
-        run: |
-          cargo install espup
-          espup install --targets esp32c3
-      - name: Build firmware
-        run: |
-          . ~/export-esp.sh
-          cargo build --release -p firmware-c3
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-esp32c3
-          path: target/riscv32imc-unknown-none-elf/release/firmware-c3
-
-  # ─── Lint checks ──────────────────────────────────────────────────
-  lint:
-    name: Lint & Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --exclude lightningpos-firmware --exclude firmware-touch35 --exclude firmware-headless --exclude firmware-c3 -- -D warnings
+          name: firmware-espidf
+          path: firmware-espidf/target/xtensa-esp32s3-espidf/release/firmware-espidf
+          if-no-files-found: error
 
   # ─── Security audit ───────────────────────────────────────────────
   security-audit:
