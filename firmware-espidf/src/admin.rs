@@ -3,7 +3,6 @@
 //! Le portail /config le demande pour toute action d'administration.
 
 use esp_idf_svc::nvs::EspDefaultNvs;
-use esp_idf_svc::sys::EspError;
 
 const KEY_PIN: &str = "admin_pin";
 
@@ -28,17 +27,25 @@ pub fn ensure_pin(nvs: &EspDefaultNvs) -> String {
     pin
 }
 
-/// Vérifie un PIN saisi (comparaison à temps constant, en dur).
+/// Vérifie un PIN saisi, en temps constant.
+///
+/// Aucun retour anticipé sur la longueur : un `return false` immédiat quand
+/// `len` diffère répondait plus vite pour un PIN de mauvaise taille, ce qui
+/// permettait de retrouver la longueur du PIN au chronomètre avant de
+/// brute-forcer sa valeur. L'écart de longueur est replié dans le même
+/// accumulateur que l'écart d'octets.
 pub fn check_pin(nvs: &EspDefaultNvs, input: &str) -> bool {
     let pin = ensure_pin(nvs);
-    if pin.len() != input.len() {
-        return false;
-    }
     let a = pin.as_bytes();
     let b = input.as_bytes();
+    let n = a.len().min(b.len());
     let mut diff = 0u8;
-    for i in 0..a.len() {
+    for i in 0..n {
         diff |= a[i] ^ b[i];
     }
+    // Replie les 32 bits de l'écart de longueur sur un octet non nul dès que
+    // les longueurs diffèrent.
+    let len_diff = (a.len() ^ b.len()) as u32;
+    diff |= (len_diff | (len_diff >> 8) | (len_diff >> 16) | (len_diff >> 24)) as u8;
     diff == 0
 }

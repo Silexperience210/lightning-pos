@@ -117,7 +117,14 @@ pub fn wifi(d: &mut Display, rssi: i8) {
     for i in 0..4usize {
         let h = 3 + 2 * i;
         let on = i < bars;
-        d.fill_round_rect_aa(x + i * 4, y + (11 - h), 3, h, 1.0, if on { c_active } else { c_off });
+        d.fill_round_rect_aa(
+            x + i * 4,
+            y + (11 - h),
+            3,
+            h,
+            1.0,
+            if on { c_active } else { c_off },
+        );
     }
 }
 
@@ -244,11 +251,29 @@ pub fn menu(
             // Navigation de page.
             d.fill_round_rect_aa(x, y, CELL_W, CELL_H, 14.0, BG);
             d.stroke_round_rect_aa(x, y, CELL_W, CELL_H, 14.0, 1.0, HAIRLINE);
-            let (arrow, lbl) = if page == 0 { (">", "SUITE") } else { ("<", "RETOUR") };
+            let (arrow, lbl) = if page == 0 {
+                (">", "SUITE")
+            } else {
+                ("<", "RETOUR")
+            };
             let aw = Display::text_tracked_width(arrow, 3, 0);
-            d.draw_text_tracked(arrow, x + CELL_W.saturating_sub(aw) / 2, y + 34, 3, 0, TXT_DIM);
+            d.draw_text_tracked(
+                arrow,
+                x + CELL_W.saturating_sub(aw) / 2,
+                y + 34,
+                3,
+                0,
+                TXT_DIM,
+            );
             let lw = Display::text_tracked_width(lbl, 1, 2);
-            d.draw_text_tracked(lbl, x + CELL_W.saturating_sub(lw) / 2, y + 68, 1, 2, TXT_MUTED);
+            d.draw_text_tracked(
+                lbl,
+                x + CELL_W.saturating_sub(lw) / 2,
+                y + 68,
+                1,
+                2,
+                TXT_MUTED,
+            );
         } else {
             // PAYER : seule surface pleine en accent de tout l'écran.
             d.fill_round_rect_aa(x, y, CELL_W, CELL_H, 14.0, AMBER);
@@ -319,7 +344,14 @@ pub fn calc(d: &mut Display, keys: &[[&str; 4]; 5], value: &str, pending: Option
                 );
             } else {
                 let w = Display::text_tracked_width(label, 2, 2);
-                d.draw_text_tracked(label, x + bw.saturating_sub(w) / 2, y + (bh - 14) / 2, 2, 2, fg);
+                d.draw_text_tracked(
+                    label,
+                    x + bw.saturating_sub(w) / 2,
+                    y + (bh - 14) / 2,
+                    2,
+                    2,
+                    fg,
+                );
             }
         }
     }
@@ -394,7 +426,14 @@ pub fn nfc_status(d: &mut Display, msg: &str, color: u16) -> std::time::Instant 
 ///
 /// La zone tactile d'annulation (70..250 × 420..464, cf. `cancel_pressed`) est
 /// exactement celle du bouton dessiné ici : les deux doivent rester alignées.
-pub fn pay_screen(d: &mut Display, n: usize, bits: &[bool], total_cents: u64, sats: u64, cur: &str) {
+pub fn pay_screen(
+    d: &mut Display,
+    n: usize,
+    bits: &[bool],
+    total_cents: u64,
+    sats: u64,
+    cur: &str,
+) {
     const QR_TOP: usize = 88;
     const QR_MAX: usize = 268;
     d.clear(BG);
@@ -423,6 +462,15 @@ pub fn pay_screen(d: &mut Display, n: usize, bits: &[bool], total_cents: u64, sa
     d.draw_text_tracked("ANNULER", 160 - w / 2, 439, 2, 3, ROSE);
 }
 
+/// Compte à rebours de la facture (pastille en haut à droite de l'écran QR).
+/// Redessine par-dessus la valeur précédente — appelé à chaque poll.
+pub fn pay_countdown(d: &mut Display, secs: u64) {
+    let s = format!("{} s", secs);
+    d.fill_round_rect_aa(232, 10, 80, 24, 12.0, BG);
+    let w = Display::text_tracked_width(&s, 1, 2);
+    d.draw_text_tracked(&s, 312 - w, 15, 1, 2, TXT_MUTED);
+}
+
 /// Écran de fin non nominale (annulé / expiré / erreur).
 /// `tone` = couleur d'accent, `mark` = glyphe affiché dans l'anneau.
 pub fn status(d: &mut Display, mark: &str, title: &str, sub: &str, tone: u16) {
@@ -443,7 +491,12 @@ pub fn status(d: &mut Display, mark: &str, title: &str, sub: &str, tone: u16) {
 /// L'ancien fade-out + fade-in doublait le rafraîchissement à chaque
 /// changement de fenêtre et paraissait lent ; ici le nouvel écran apparaît en
 /// ~36 ms, le fond noir ne s'affiche jamais seul.
-pub fn crossfade(d: &mut Display, _from: impl Fn(&mut Display), to: impl Fn(&mut Display), ms: u64) {
+pub fn crossfade(
+    d: &mut Display,
+    _from: impl Fn(&mut Display),
+    to: impl Fn(&mut Display),
+    ms: u64,
+) {
     to(d);
     let steps = 3u64;
     let step = (ms / steps).max(8);
@@ -465,7 +518,7 @@ const PAID_H: f32 = 384.0;
 
 /// Jaunes dégradés du glow par silhouettes décalées (Direction Singularity).
 const GLOW_INNER: u16 = 0xFFFF; // blanc, cœur
-const GLOW_MID: u16 = 0xFFE0;   // jaune vif
+const GLOW_MID: u16 = 0xFFE0; // jaune vif
 const GLOW_OUTER: u16 = 0xFCC0; // ambre
 
 /// Dessine le bloc texte du succès (montant héros + confirmation).
@@ -507,16 +560,7 @@ fn paid_bolt(d: &mut Display, cx: f32, cy: f32, h: f32, breath: f32) {
         GLOW_MID,
         (210.0 * breath) as u8,
     );
-    bolt::draw_solid(
-        d.fb_mut(),
-        SCREEN_W,
-        SCREEN_H,
-        cx,
-        cy,
-        h,
-        GLOW_INNER,
-        255,
-    );
+    bolt::draw_solid(d.fb_mut(), SCREEN_W, SCREEN_H, cx, cy, h, GLOW_INNER, 255);
 }
 
 /// Séquence de confirmation : flash blanc 50 ms → éclair plein avec glow →

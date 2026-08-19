@@ -2,14 +2,7 @@
 //! Chaque glyphe = 5 octets (une colonne, 7 bits significatifs, bit 0 = haut).
 
 /// Rend un caractère dans le framebuffer (couleur donnée). Retourne la largeur.
-pub fn draw_char(
-    fb: &mut [u16],
-    w: usize,
-    c: char,
-    x: usize,
-    y: usize,
-    color: u16,
-) -> usize {
+pub fn draw_char(fb: &mut [u16], w: usize, c: char, x: usize, y: usize, color: u16) -> usize {
     let glyph = glyph(c);
     for col in 0..5 {
         let bits = glyph[col];

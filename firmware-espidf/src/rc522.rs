@@ -264,11 +264,15 @@ impl<'d> Rc522<'d> {
         // (La lib Arduino elle-même refuse de dumper ce type : « Dumping memory
         // contents not implemented for that PICC type. »)
         if sak & 0x20 != 0 {
-            println!("[RC522] carte ISO14443-4 (SAK=0x{sak:02X}) → lecture NDEF Type 4 (RATS + APDU)");
+            println!(
+                "[RC522] carte ISO14443-4 (SAK=0x{sak:02X}) → lecture NDEF Type 4 (RATS + APDU)"
+            );
             return self.read_ndef_type4();
         }
         if sak == 0x00 {
-            println!("[RC522] carte Type 2 (NTAG/MIFARE Ultralight, SAK=0x00) → lecture READ (0x30)");
+            println!(
+                "[RC522] carte Type 2 (NTAG/MIFARE Ultralight, SAK=0x00) → lecture READ (0x30)"
+            );
             return self.read_ndef_type2();
         }
         // MIFARE Classic : SAK 0x08 = 1K, 0x18 = 4K, 0x88 = 1K à UID « NXP » (bit 7
@@ -278,7 +282,9 @@ impl<'d> Rc522<'d> {
         // adressés, ce qui reste valable sur une 4K (ses 32 premiers secteurs font
         // aussi 4 blocs) car le MAD1 ne décrit que les secteurs 1..15.
         if sak == 0x08 || sak == 0x18 || sak == 0x88 {
-            println!("[RC522] carte MIFARE Classic (SAK=0x{sak:02X}) → auth Crypto-1 + READ (0x30)");
+            println!(
+                "[RC522] carte MIFARE Classic (SAK=0x{sak:02X}) → auth Crypto-1 + READ (0x30)"
+            );
             return self.read_ndef_mifare_classic();
         }
         println!("[RC522] SAK=0x{sak:02X} non supporté");
@@ -312,9 +318,7 @@ impl<'d> Rc522<'d> {
         let mut buf = Vec::with_capacity(1 + data.len());
         buf.push(addr);
         buf.extend_from_slice(data);
-        self.spi
-            .write(&buf)
-            .map_err(|e| format!("write_fifo: {e}"))
+        self.spi.write(&buf).map_err(|e| format!("write_fifo: {e}"))
     }
 
     /// Lit `n` octets de la FIFO — lecture octet par octet (le clone FM17522 ne
@@ -361,7 +365,12 @@ impl<'d> Rc522<'d> {
     // `last_bits` = 0 (octets pleins) ou 7 (trame courte REQA).
     // Retourne Some(reponse) si des données sont reçues, None si timeout.
     // -----------------------------------------------------------------------
-    fn transceive(&mut self, data: &[u8], last_bits: u8, use_crc: bool) -> Result<Option<Vec<u8>>, String> {
+    fn transceive(
+        &mut self,
+        data: &[u8],
+        last_bits: u8,
+        use_crc: bool,
+    ) -> Result<Option<Vec<u8>>, String> {
         // RxAlign (BitFramingReg[6:4]) reste 0 : pour une lecture propre (une seule
         // carte, pas de collision) la réponse est alignée sur l'octet. La lib Arduino
         // ne met rxAlign ≠ 0 que pendant la résolution de collision (PICC_Select).
@@ -661,11 +670,19 @@ impl<'d> Rc522<'d> {
         };
         if ats.len() >= 2 {
             // T0 : quartet bas = FSCI (taille max des trames émises par la carte).
-            println!("[RC522] ATS TL={} T0=0x{:02X} FSCI={}", ats[0], ats[1], ats[1] & 0x0F);
+            println!(
+                "[RC522] ATS TL={} T0=0x{:02X} FSCI={}",
+                ats[0],
+                ats[1],
+                ats[1] & 0x0F
+            );
         }
 
         // 2) SELECT de l'application NDEF par nom de DF (AID D2760000850101).
-        if self.apdu_data(&Self::SEL_NDEF_APP, "SELECT AID NDEF")?.is_none() {
+        if self
+            .apdu_data(&Self::SEL_NDEF_APP, "SELECT AID NDEF")?
+            .is_none()
+        {
             return Ok(None);
         }
 
@@ -689,10 +706,7 @@ impl<'d> Rc522<'d> {
         // GetFileCounters : 90 F6 00 00 01 <FileNr> → SDMReadCtr 3 o LSB first.
         // Le numéro de fichier NDEF n'est pas connu a priori → essaie 2, 1, 3.
         for nr in [2u8, 1, 3] {
-            match self.apdu_data(
-                &[0x90, 0xF5, 0x00, 0x00, 0x01, nr, 0x00],
-                "GETFILESETTINGS",
-            )? {
+            match self.apdu_data(&[0x90, 0xF5, 0x00, 0x00, 0x01, nr, 0x00], "GETFILESETTINGS")? {
                 Some(fs) if fs.len() >= 8 => {
                     println!(
                         "[RC522] FileSettings(#{nr}) ({} o) = {:02X?} SDMOptions=0x{:02X}",
@@ -706,10 +720,7 @@ impl<'d> Rc522<'d> {
             }
         }
         for nr in [2u8, 1, 3] {
-            match self.apdu_data(
-                &[0x90, 0xF6, 0x00, 0x00, 0x01, nr, 0x00],
-                "GETFILECOUNTERS",
-            )? {
+            match self.apdu_data(&[0x90, 0xF6, 0x00, 0x00, 0x01, nr, 0x00], "GETFILECOUNTERS")? {
                 Some(ct) if ct.len() >= 3 => {
                     let ctr = u32::from_le_bytes([ct[0], ct[1], ct[2], 0]);
                     println!("[RC522] SDMReadCtr(#{nr}) = {ctr}");
@@ -954,7 +965,10 @@ impl<'d> Rc522<'d> {
         uid: &[u8],
     ) -> Result<bool, String> {
         if uid.len() < 4 {
-            return Err(format!("auth bloc {block}: UID trop court ({} o)", uid.len()));
+            return Err(format!(
+                "auth bloc {block}: UID trop court ({} o)",
+                uid.len()
+            ));
         }
         let uid4 = &uid[uid.len() - 4..];
 
@@ -977,8 +991,8 @@ impl<'d> Rc522<'d> {
         // Succès = MFCrypto1On (Status2Reg bit 3) passe à 1. Un échec se traduit
         // par TimerIRq (la carte ne répond pas) ou par l'expiration de la borne
         // logicielle : dans les deux cas MFCrypto1On reste à 0.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(self.timeout_ms as u64 + 25);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(self.timeout_ms as u64 + 25);
         loop {
             if self.read_reg(STATUS2_REG)? & STATUS2_MFCRYPTO1_ON != 0 {
                 self.write_reg(COMMAND_REG, CMD_IDLE)?;
@@ -1278,24 +1292,32 @@ fn parse_ndef_tlv(data: &[u8]) -> Option<String> {
     None
 }
 
-/// Vrai si la chaîne ressemble à un LNURL exploitable (filtre de vraisemblance
-/// appliqué à tous les types de record, insensible à la casse).
+/// Vrai si la chaîne est une **forme LNURL** exploitable par le POS, c'est-à-dire
+/// `lnurlw://…` ou le bech32 `lnurl1…`, éventuellement préfixés de `lightning:`.
+///
+/// Les anciens critères (« contient lnurl / withdraw / boltcard ») laissaient
+/// passer n'importe quelle URL portant l'un de ces mots : un tag NFC quelconque
+/// suffisait à faire émettre au POS un GET vers l'hôte de son choix. La
+/// validation finale du schéma et de l'hôte est faite par `normalize_lnurl`.
 fn looks_like_lnurl(s: &str) -> bool {
-    let l = s.trim().to_ascii_lowercase();
-    l.starts_with("lnurl")
-        || l.starts_with("lightning:")
-        || l.contains("lnurl")
-        || l.contains("withdraw")
-        || l.contains("boltcard")
+    let mut l = s.trim().to_ascii_lowercase();
+    for p in ["lightning://", "lightning:"] {
+        if let Some(rest) = l.strip_prefix(p) {
+            l = rest.to_string();
+            break;
+        }
+    }
+    l.starts_with("lnurlw://") || l.starts_with("lnurl1")
 }
 
 /// Itère sur les records d'un message NDEF et extrait l'URI du premier record qui
-/// ressemble à un LNURL. Gère TNF=1 type "U" (préfixe URI), TNF=1 type "T" (texte),
-/// et TNF=3 (URI absolue, l'URI est dans le champ TYPE). Champs SR/IL décodés
-/// proprement, drapeaux ME/CF respectés. À défaut de LNURL vraisemblable, renvoie
-/// la première URI rencontrée.
+/// est une forme LNURL (cf. [`looks_like_lnurl`]). Gère TNF=1 type "U" (préfixe
+/// URI), TNF=1 type "T" (texte), et TNF=3 (URI absolue, l'URI est dans le champ
+/// TYPE). Champs SR/IL décodés proprement, drapeaux ME/CF respectés.
+///
+/// Aucun repli sur « la première URI rencontrée » : ce repli faisait remonter
+/// l'URL d'un tag NFC quelconque jusqu'au GET du flux de paiement.
 fn parse_ndef_records(ndef: &[u8]) -> Option<String> {
-    let mut fallback: Option<String> = None;
     let mut i = 0usize;
     while i < ndef.len() {
         let flags = ndef[i];
@@ -1401,9 +1423,6 @@ fn parse_ndef_records(ndef: &[u8]) -> Option<String> {
             if looks_like_lnurl(&uri) {
                 return Some(uri);
             }
-            if fallback.is_none() {
-                fallback = Some(uri);
-            }
         }
 
         // ME : dernier record du message, la suite n'est que du padding.
@@ -1412,45 +1431,45 @@ fn parse_ndef_records(ndef: &[u8]) -> Option<String> {
         }
         i = payload_end;
     }
-    fallback
+    None
 }
 
 /// Table des préfixes URI NFC Forum (0x00..0x23).
 const URI_PREFIXES: [&str; 36] = [
-    "",                                     // 0x00
-    "http://www.",                          // 0x01
-    "https://www.",                         // 0x02
-    "http://",                              // 0x03
-    "https://",                             // 0x04
-    "tel:",                                 // 0x05
-    "mailto:",                              // 0x06
-    "ftp://anonymous:anonymous@",           // 0x07
-    "ftp://ftp.",                           // 0x08
-    "ftps://",                              // 0x09
-    "sftp://",                              // 0x0A
-    "smb://",                               // 0x0B
-    "nfs://",                               // 0x0C
-    "ftp://",                               // 0x0D
-    "dav://",                               // 0x0E
-    "news:",                                // 0x0F
-    "telnet://",                            // 0x10
-    "imap:",                                // 0x11
-    "rtsp://",                              // 0x12
-    "urn:",                                 // 0x13
-    "pop:",                                 // 0x14
-    "sip:",                                 // 0x15
-    "sips:",                                // 0x16
-    "tftp:",                                // 0x17
-    "btspp://",                             // 0x18
-    "btl2cap://",                           // 0x19
-    "btgoep://",                            // 0x1A
-    "tcpobex://",                           // 0x1B
-    "irdaobex://",                          // 0x1C
-    "file://",                              // 0x1D
-    "urn:epc:id:",                          // 0x1E
-    "urn:epc:tag:",                         // 0x1F
-    "urn:epc:pat:",                         // 0x20
-    "urn:epc:raw:",                         // 0x21
-    "urn:epc:",                             // 0x22
-    "urn:nfc:",                             // 0x23
+    "",                           // 0x00
+    "http://www.",                // 0x01
+    "https://www.",               // 0x02
+    "http://",                    // 0x03
+    "https://",                   // 0x04
+    "tel:",                       // 0x05
+    "mailto:",                    // 0x06
+    "ftp://anonymous:anonymous@", // 0x07
+    "ftp://ftp.",                 // 0x08
+    "ftps://",                    // 0x09
+    "sftp://",                    // 0x0A
+    "smb://",                     // 0x0B
+    "nfs://",                     // 0x0C
+    "ftp://",                     // 0x0D
+    "dav://",                     // 0x0E
+    "news:",                      // 0x0F
+    "telnet://",                  // 0x10
+    "imap:",                      // 0x11
+    "rtsp://",                    // 0x12
+    "urn:",                       // 0x13
+    "pop:",                       // 0x14
+    "sip:",                       // 0x15
+    "sips:",                      // 0x16
+    "tftp:",                      // 0x17
+    "btspp://",                   // 0x18
+    "btl2cap://",                 // 0x19
+    "btgoep://",                  // 0x1A
+    "tcpobex://",                 // 0x1B
+    "irdaobex://",                // 0x1C
+    "file://",                    // 0x1D
+    "urn:epc:id:",                // 0x1E
+    "urn:epc:tag:",               // 0x1F
+    "urn:epc:pat:",               // 0x20
+    "urn:epc:raw:",               // 0x21
+    "urn:epc:",                   // 0x22
+    "urn:nfc:",                   // 0x23
 ];

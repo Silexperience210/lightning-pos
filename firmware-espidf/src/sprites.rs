@@ -12,14 +12,7 @@ pub static FRAMES: &[u8] = include_bytes!("../assets/bolt_sprites.bin");
 
 /// Blitte la frame `idx` centrée en `(cx, cy)`. Les pixels noirs sont
 /// transparents pour ne pas écraser un fond éventuel.
-pub fn draw_frame(
-    fb: &mut [u16],
-    fbw: usize,
-    _fbh: usize,
-    cx: usize,
-    cy: usize,
-    idx: usize,
-) {
+pub fn draw_frame(fb: &mut [u16], fbw: usize, _fbh: usize, cx: usize, cy: usize, idx: usize) {
     let idx = idx % SPR_N;
     let off = idx * SPR_W * SPR_H * 2;
     let half_w = SPR_W / 2;

@@ -104,7 +104,10 @@ fn draw_char(
                 let py1 = ((y + (row as f32 + 1.0) * s).round() as i32).max(py0 + 1);
                 for py in py0..py1 {
                     for px in px0..px1 {
-                        if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) * w + (px as usize) < fb.len()
+                        if px >= 0
+                            && py >= 0
+                            && (px as usize) < w
+                            && (py as usize) * w + (px as usize) < fb.len()
                         {
                             blend(fb, w, px as usize, py as usize, color, alpha, 1.0);
                         }

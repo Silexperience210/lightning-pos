@@ -58,12 +58,18 @@ impl LnurlWithdraw {
     }
 }
 
-/// EUR cents → sats (prix BTC en EUR cents). Arrondi vers le bas.
+/// EUR cents → sats (prix BTC en EUR cents).
+///
+/// Arrondi au sat supérieur : la troncature facturait systématiquement moins
+/// que le prix affiché (jusqu'à 1 sat de manque par vente, au détriment du
+/// marchand). Le sur-arrondi est plafonné à 1 sat, soit une fraction de centime.
 pub fn eur_cents_to_sats(eur_cents: u64, btc_price_cents: u64) -> u64 {
     if btc_price_cents == 0 {
         return 0;
     }
-    ((eur_cents as u128) * 100_000_000 / (btc_price_cents as u128)) as u64
+    let num = (eur_cents as u128) * 100_000_000;
+    let den = btc_price_cents as u128;
+    num.div_ceil(den) as u64
 }
 
 /// sats → msat (les montants LNURL sont en msat)
@@ -102,8 +108,12 @@ mod tests {
 
     #[test]
     fn eur_to_sats() {
-        assert_eq!(eur_cents_to_sats(100, 6_723_450), 1487);
-        assert_eq!(eur_cents_to_sats(1_000, 6_723_450), 14_873);
+        // Arrondi au sat supérieur (en faveur du marchand).
+        assert_eq!(eur_cents_to_sats(100, 6_723_450), 1488);
+        assert_eq!(eur_cents_to_sats(1_000, 6_723_450), 14_874);
         assert_eq!(eur_cents_to_sats(100, 0), 0);
+        // Division exacte : pas de sat ajouté.
+        assert_eq!(eur_cents_to_sats(1, 100_000_000), 1);
+        assert_eq!(eur_cents_to_sats(0, 6_723_450), 0);
     }
 }

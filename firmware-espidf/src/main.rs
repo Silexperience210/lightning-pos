@@ -10,11 +10,9 @@ mod display;
 mod font;
 mod glyph;
 mod journal;
-mod pn532;
 mod qr;
 mod rc522;
 mod render3d;
-mod secrets;
 mod sprites;
 mod store;
 mod theme;
@@ -24,22 +22,23 @@ mod web;
 mod wifi_cfg;
 
 use core::convert::TryInto;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use boltcard::LnurlWithdraw;
 use display::Display;
-use theme::*;
-use ui::{CALC_X_MAX, CALC_Y, CELL_H, CELL_W, CLEAR_X_MIN, GAP, GRID_Y, HEAD_H};
 use esp_idf_hal::adc::attenuation::DB_12;
 use esp_idf_hal::adc::oneshot::config::AdcChannelConfig;
 use esp_idf_hal::adc::oneshot::{AdcChannelDriver, AdcDriver};
 use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::i2c::{I2cConfig, I2cDriver};
 use esp_idf_hal::peripherals::Peripherals;
-use esp_idf_hal::spi::{SpiDeviceDriver, SpiDriver, SpiDriverConfig, SpiConfig};
+use esp_idf_hal::spi::{SpiConfig, SpiDeviceDriver, SpiDriver, SpiDriverConfig};
 use esp_idf_hal::units::Hertz;
 use rc522::Rc522;
+use theme::*;
 use touch::Touch;
+use ui::{CALC_X_MAX, CALC_Y, CELL_H, CELL_W, CLEAR_X_MIN, GAP, GRID_Y, HEAD_H};
 
 use embedded_svc::{
     http::{client::Client as HttpClient, Method},
@@ -52,6 +51,7 @@ use esp_idf_svc::{
     http::client::EspHttpConnection,
     log::EspLogger,
     nvs::{EspDefaultNvs, EspDefaultNvsPartition},
+    sntp::EspSntp,
     sys,
     wifi::{BlockingWifi, EspWifi},
 };
@@ -70,9 +70,8 @@ fn http_req(
 ) -> Result<(u16, String), String> {
     let mut conf = esp_idf_svc::http::client::Configuration::default();
     conf.crt_bundle_attach = Some(esp_idf_sys::esp_crt_bundle_attach);
-    let mut client = HttpClient::wrap(
-        EspHttpConnection::new(&conf).map_err(|e| format!("conn: {e}"))?,
-    );
+    let mut client =
+        HttpClient::wrap(EspHttpConnection::new(&conf).map_err(|e| format!("conn: {e}"))?);
     let mut request = client
         .request(method, url, headers)
         .map_err(|e| format!("req: {e}"))?;
@@ -105,6 +104,12 @@ fn http_req(
     Ok((status, resp))
 }
 
+/// Durée de vie d'une facture, en secondes. Le POS abandonne le poll au bout du
+/// même délai : passée cette limite, la facture est morte côté LNbits — une
+/// vente annulée (bouton ANNULER) ne peut plus être payée « dans le dos » du POS,
+/// qui ne l'enregistrerait pas.
+const INVOICE_TTL_SECS: u64 = 90;
+
 /// Crée une facture LNbits (montant en sats) → (payment_hash, bolt11).
 /// L'instance LNbits est configurable via le portail web (/config).
 fn create_invoice(amount_sats: u64, memo: &str) -> Result<(String, String), String> {
@@ -117,10 +122,15 @@ fn create_invoice(amount_sats: u64, memo: &str) -> Result<(String, String), Stri
         ("X-Api-Key", key.as_str()),
         ("Content-Type", "application/json"),
     ];
-    let body = format!(
-        r#"{{"out": false, "amount": {}, "memo": "{}"}}"#,
-        amount_sats, memo
-    );
+    // JSON construit par serde_json : le memo est échappé quoi qu'il contienne
+    // (une construction à la main casserait le corps sur un guillemet).
+    let body = serde_json::json!({
+        "out": false,
+        "amount": amount_sats,
+        "memo": memo,
+        "expiry": INVOICE_TTL_SECS,
+    })
+    .to_string();
     let (status, resp) = http_req(Method::Post, &url, &headers, Some(&body))?;
     if status != 201 && status != 200 {
         return Err(format!("invoice HTTP {status}: {resp}"));
@@ -140,7 +150,11 @@ fn poll_paid(hash: &str) -> Result<bool, String> {
     if config::load_key(web::cfg_nvs()).is_empty() {
         return Err("clé LNbits non configurée (portail /config)".to_string());
     }
-    let url = format!("{}/api/v1/payments/{}", config::load_url(web::cfg_nvs()), hash);
+    let url = format!(
+        "{}/api/v1/payments/{}",
+        config::load_url(web::cfg_nvs()),
+        hash
+    );
     let key = config::load_key(web::cfg_nvs());
     let headers = [("X-Api-Key", key.as_str())];
     let (status, resp) = http_req(Method::Get, &url, &headers, None)?;
@@ -152,9 +166,17 @@ fn poll_paid(hash: &str) -> Result<bool, String> {
     Ok(v["paid"].as_bool().unwrap_or(false))
 }
 
-/// Normalise une URI LNURL → URL https absolue.
-/// Gère : `lightning:`/`lightning://` (préfixe), `lnurlw://`/`lnurlc://`/`lnurlp://`
-/// (LUD-17 → https://), le bech32 `lnurl1…` (LUD-01), et http(s) tel quel.
+/// Normalise une URI LNURL-withdraw lue sur une carte → URL absolue à requêter.
+///
+/// Seules les **formes LNURL** sont acceptées : `lnurlw://` (LUD-17), le bech32
+/// `lnurl1…` (LUD-01), éventuellement préfixés de `lightning:` / `lightning://`.
+/// Une URL http(s) brute est refusée : n'importe quel tag NFC posé sur le
+/// lecteur déclenchait sinon un GET vers l'adresse de son choix, y compris un
+/// hôte du réseau local du commerçant (SSRF). `lnurlc://` (channel) et
+/// `lnurlp://` (pay) sont également refusés — le POS n'encaisse qu'en withdraw.
+///
+/// L'URL obtenue est revalidée (schéma, hôte, userinfo, longueur) avant tout
+/// appel réseau.
 fn normalize_lnurl(uri: &str) -> Result<String, String> {
     let mut u = uri.trim();
 
@@ -167,32 +189,25 @@ fn normalize_lnurl(uri: &str) -> Result<String, String> {
         }
     }
 
-    // Schémas LUD-17 → https://
     let lower = u.to_ascii_lowercase();
-    for (scheme, proto) in [
-        ("lnurlw://", "https://"),
-        ("lnurlc://", "https://"),
-        ("lnurlp://", "https://"),
-    ] {
-        if lower.starts_with(scheme) {
-            return Ok(format!("{proto}{}", &u[scheme.len()..]));
-        }
-    }
+    // `to_ascii_lowercase` conserve la longueur en octets : les index calculés
+    // sur `lower` sont valides sur `u`.
+    let url = if lower.starts_with("lnurlw://") {
+        // LUD-17 : lnurlw:// → https://
+        format!("https://{}", &u["lnurlw://".len()..])
+    } else if lower.starts_with("lnurl1") {
+        // bech32 `lnurl1…` (LUD-01) → URL absolue.
+        bech32::decode_lnurl(u)?
+    } else {
+        return Err(format!(
+            "lnurl: forme non reconnue ({})",
+            u.chars().take(40).collect::<String>()
+        ));
+    };
 
-    // bech32 `lnurl1…` (LUD-01) → URL https absolue.
-    if lower.starts_with("lnurl1") {
-        return bech32::decode_lnurl(u);
-    }
-
-    // http(s) tel quel.
-    if lower.starts_with("http://") || lower.starts_with("https://") {
-        return Ok(u.to_string());
-    }
-
-    Err(format!(
-        "lnurl: schéma non reconnu ({})",
-        u.chars().take(40).collect::<String>()
-    ))
+    config::validate_url(&url, config::MAX_LNURL_LEN)
+        .map_err(|e| format!("lnurl: URL refusée ({e})"))?;
+    Ok(url)
 }
 
 /// Résout l'URI NDEF de la carte → LnurlWithdraw (normalise + GET + parse).
@@ -202,7 +217,12 @@ fn resolve_lnurl(uri: &str) -> Result<LnurlWithdraw, String> {
     if status != 200 {
         return Err(format!("lnurl HTTP {status}: {resp}"));
     }
-    LnurlWithdraw::parse(&resp)
+    let w = LnurlWithdraw::parse(&resp)?;
+    // Le `callback` vient de la réponse d'un serveur désigné par la carte : il
+    // est aussi peu digne de confiance que l'URI de la carte elle-même.
+    config::validate_url(&w.callback, config::MAX_LNURL_LEN)
+        .map_err(|e| format!("lnurl: callback refusé ({e})"))?;
+    Ok(w)
 }
 
 /// Parse la réponse JSON d'un callback LNURL-withdraw → Ok(()) si `status == "OK"`.
@@ -244,7 +264,8 @@ fn fetch_btc_price(cur: &str) -> Result<f64, String> {
         "GBP" => "gbp",
         _ => "eur",
     };
-    let url = format!("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={vs}");
+    let url =
+        format!("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={vs}");
     let (status, resp) = http_req(Method::Get, &url, &[], None)?;
     if status != 200 {
         return Err(format!("coingecko HTTP {status}"));
@@ -254,6 +275,44 @@ fn fetch_btc_price(cur: &str) -> Result<f64, String> {
     v["bitcoin"][vs]
         .as_f64()
         .ok_or_else(|| "pas de prix".to_string())
+}
+
+/// Cache du prix BTC : (prix en centimes, instant du dernier fetch réussi).
+static PRICE: Mutex<Option<(u64, Instant)>> = Mutex::new(None);
+
+/// Durée de validité du prix en cache. Au-delà, il est rafraîchi au paiement
+/// suivant : un POS allumé plusieurs jours ne facture plus au cours du boot.
+const PRICE_TTL: Duration = Duration::from_secs(600);
+
+/// Prix BTC en centimes, frais à ≤ `PRICE_TTL`. Sur échec réseau, le dernier
+/// prix connu est conservé (facturer au cours d'il y a 10 min vaut mieux que
+/// refuser la vente) ; 0 uniquement si aucun prix n'a jamais été obtenu.
+fn btc_price_cents_fresh(cur: &str) -> u64 {
+    // Copie puis relâche le verrou : le fetch HTTP dure des secondes, le garder
+    // bloquerait tout autre appelant (et l'appelant courant se re-verrouille plus bas).
+    let cached = *PRICE.lock().unwrap();
+    if let Some((cents, at)) = cached {
+        if at.elapsed() < PRICE_TTL {
+            return cents;
+        }
+    }
+    let last = cached.map(|(c, _)| c).unwrap_or(0);
+    match fetch_btc_price(cur) {
+        Ok(p) => {
+            let cents = (p * 100.0).round().max(0.0) as u64;
+            if cents == 0 {
+                println!("[BTC] prix nul reçu → dernier prix connu ({last})");
+                return last;
+            }
+            println!("[BTC] prix {cur} = {p}");
+            *PRICE.lock().unwrap() = Some((cents, Instant::now()));
+            cents
+        }
+        Err(e) => {
+            println!("[BTC] rafraîchissement échoué: {e} → dernier prix connu ({last})");
+            last
+        }
+    }
 }
 
 /// Pourcentage de charge estimé à partir de la tension batterie (mV).
@@ -332,7 +391,7 @@ fn pay(
     touch: &mut Touch,
     rc522: &mut Rc522,
     total_cents: u64,
-    btc_price_cents: u64,
+    label: &str,
     journal_nvs: &EspDefaultNvs,
 ) -> bool {
     if total_cents == 0 {
@@ -348,20 +407,10 @@ fn pay(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let mut btc_price_cents = btc_price_cents;
     let cur = config::load_currency(web::cfg_nvs());
-    if btc_price_cents == 0 {
-        // Prix absent au boot (rate-limit CoinGecko / coupure réseau) : re-fetch
-        // au moment du paiement avant de refuser, pour éviter l'écran « PRIX BTC ? ».
-        println!("[BTC] prix absent au boot → re-fetch au paiement");
-        match fetch_btc_price(&cur) {
-            Ok(p) => {
-                println!("[BTC] prix {cur} = {p} (re-fetch)");
-                btc_price_cents = (p * 100.0).round().max(0.0) as u64;
-            }
-            Err(e) => println!("[BTC] re-fetch échoué: {e}"),
-        }
-    }
+    // Cours rafraîchi à chaque vente (cache 10 min) : le prix du boot n'est
+    // plus figé pour la durée de vie de l'appareil.
+    let btc_price_cents = btc_price_cents_fresh(&cur);
     let sats = boltcard::eur_cents_to_sats(total_cents, btc_price_cents);
     if sats == 0 {
         display.clear(BLACK);
@@ -413,8 +462,12 @@ fn pay(
             let mut last_failed_card: Option<String> = None;
             // Borne de temps réelle : une itération dure de 1,3 à 3 s (NFC + HTTP),
             // un simple compteur de tours donnait un timeout de 80 à 180 s.
-            let deadline = Instant::now() + Duration::from_secs(90);
+            let deadline = Instant::now() + Duration::from_secs(INVOICE_TTL_SECS);
             while Instant::now() < deadline {
+                // Compte à rebours de la facture (secondes restantes).
+                let remain = deadline.saturating_duration_since(Instant::now()).as_secs();
+                ui::pay_countdown(display, remain);
+                display.flush();
                 if cancel_pressed(touch) {
                     cancelled = true;
                     break;
@@ -422,7 +475,10 @@ fn pay(
                 // Carte NFC (Bolt Card Type 4 ou badge NTAG Type 2) : LNURL-withdraw.
                 if !callback_sent {
                     match rc522.read_ndef_uri() {
-                        Ok(Some(uri)) if last_failed_card.as_deref() == Some(uri.split('?').next().unwrap_or(&uri)) => {
+                        Ok(Some(uri))
+                            if last_failed_card.as_deref()
+                                == Some(uri.split('?').next().unwrap_or(&uri)) =>
+                        {
                             // Carte déjà refusée : inutile de la rejouer à chaque tour.
                         }
                         Ok(Some(uri)) => {
@@ -433,7 +489,8 @@ fn pay(
                                 Ok(w) if !w.amount_in_range_msat(boltcard::sats_to_msat(sats)) => {
                                     println!("[POS] montant hors plage carte");
                                     status_at = Some(ui::nfc_status(display, "REFUSE", ROSE));
-                                    last_failed_card = Some(uri.split('?').next().unwrap_or(&uri).to_string());
+                                    last_failed_card =
+                                        Some(uri.split('?').next().unwrap_or(&uri).to_string());
                                 }
                                 Ok(w) => {
                                     let cb = w.build_callback_url(&bolt11);
@@ -442,24 +499,28 @@ fn pay(
                                         Ok((s, body)) => match parse_callback(s, &body) {
                                             Ok(()) => {
                                                 println!("[POS] callback OK (HTTP {s})");
-                                                status_at = Some(ui::nfc_status(display, "CARTE OK", MINT));
+                                                status_at =
+                                                    Some(ui::nfc_status(display, "CARTE OK", MINT));
                                             }
                                             Err(e) => {
                                                 println!("[POS] callback refusé: {e}");
-                                                status_at = Some(ui::nfc_status(display, "REFUSE", ROSE));
+                                                status_at =
+                                                    Some(ui::nfc_status(display, "REFUSE", ROSE));
                                             }
                                         },
                                         // État inconnu côté service : on ne rejoue pas.
                                         Err(e) => {
                                             println!("[POS] callback err: {e}");
-                                            status_at = Some(ui::nfc_status(display, "ATTENDEZ", GOLD));
+                                            status_at =
+                                                Some(ui::nfc_status(display, "ATTENDEZ", GOLD));
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     println!("[POS] lnurl err: {e}");
                                     status_at = Some(ui::nfc_status(display, "RESSAYEZ", GOLD));
-                                    last_failed_card = Some(uri.split('?').next().unwrap_or(&uri).to_string());
+                                    last_failed_card =
+                                        Some(uri.split('?').next().unwrap_or(&uri).to_string());
                                 }
                             }
                         }
@@ -508,15 +569,18 @@ fn pay(
             }
             display.clear(BLACK);
             if paid {
-                // Journal : persiste la transaction (montant, sats, hash, uptime).
-                let ts = (unsafe { esp_idf_sys::esp_timer_get_time() } / 1_000_000) as u64;
+                // Journal : persiste la transaction (date, montant, sats, hash).
+                let (ts, epoch) = journal::now_ts();
                 if let Err(e) = journal::record(
                     journal_nvs,
                     &journal::Tx {
                         seq: 0,
                         ts,
+                        epoch,
                         cents: total_cents,
                         sats,
+                        cur: cur.clone(),
+                        label: label.to_string(),
                         hash: hash.clone(),
                     },
                 ) {
@@ -617,6 +681,7 @@ fn main() {
     let cfg_ssid = wifi_cfg::ssid();
     let cfg_pass = wifi_cfg::pass();
     let ap_ssid = format!("LightningPoS-{}", wifi_cfg::ap_suffix());
+    let ap_pass = wifi_cfg::ap_pass();
     let mut sta_cfg = ClientConfiguration {
         ssid: cfg_ssid.as_str().try_into().unwrap_or_default(),
         password: cfg_pass.as_str().try_into().unwrap_or_default(),
@@ -635,8 +700,10 @@ fn main() {
         sta_cfg,
         AccessPointConfiguration {
             ssid: ap_ssid.as_str().try_into().unwrap_or_default(),
-            password: Default::default(),
-            auth_method: AuthMethod::None, // AP ouvert : le portail est protégé par le PIN admin
+            // WPA2 : le portail (et donc le PIN admin qui y transite) n'est
+            // plus lisible en clair par un tiers à portée radio.
+            password: ap_pass.as_str().try_into().unwrap_or_default(),
+            auth_method: AuthMethod::WPA2Personal,
             ..Default::default()
         },
     );
@@ -654,6 +721,10 @@ fn main() {
         wifi_cfg::store_scan(list);
     }
 
+    // Horloge murale : SNTP démarré une fois la STA connectée. Sans lui, le
+    // journal n'aurait que l'uptime (remis à zéro à chaque reboot). Le handle
+    // doit vivre aussi longtemps que le programme — d'où le `_sntp` dans main.
+    let mut _sntp = None;
     if cfg_ssid.is_empty() {
         println!("[WIFI] non configuré → AP « {ap_ssid} » + portail http://192.168.4.1");
     } else {
@@ -661,6 +732,15 @@ fn main() {
             Ok(_) => {
                 wifi.wait_netif_up().unwrap();
                 println!("[WIFI] connecté à {cfg_ssid}");
+                match EspSntp::new_default() {
+                    // La synchro est asynchrone : les toutes premières ventes
+                    // après le boot peuvent encore être horodatées en uptime.
+                    Ok(s) => {
+                        println!("[SNTP] démarré (pool.ntp.org, UTC)");
+                        _sntp = Some(s);
+                    }
+                    Err(e) => println!("[SNTP] démarrage échoué: {e}"),
+                }
             }
             Err(e) => println!("[WIFI] échec connexion à {cfg_ssid}: {e} (AP toujours actif)"),
         }
@@ -670,31 +750,23 @@ fn main() {
     let _server = web::start(nvs_products, nvs_journal, nvs_cfg).unwrap();
     println!("[WEB] portail config prêt");
 
-    // Prix BTC converti une fois en centimes : la conversion €→sats se fait
-    // ensuite en entier (boltcard::eur_cents_to_sats), sans perte f64.
+    // Amorce le cache de prix (il sera rafraîchi à chaque vente, cf. PRICE_TTL).
     // Retry : CoinGecko rate-limite après plusieurs boots → on retente 3×.
-    let mut btc_price_cents: u64 = 0;
     let cur = config::load_currency(web::cfg_nvs());
     for attempt in 0..3u32 {
-        match fetch_btc_price(&cur) {
-            Ok(p) => {
-                println!("[BTC] prix {cur} = {p}");
-                btc_price_cents = (p * 100.0).round().max(0.0) as u64;
-                break;
-            }
-            Err(e) => {
-                println!("[BTC] tentative {}/3 prix indisponible: {e}", attempt + 1);
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+        if btc_price_cents_fresh(&cur) > 0 {
+            break;
         }
+        println!("[BTC] tentative {}/3 prix indisponible", attempt + 1);
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
     // --- RC522 (SPI3 : SCK=6, MOSI=15, MISO=7, CS=17, RST=14) ---
     // RST déplacé sur GPIO14 : GPIO5 est le diviseur de tension batterie (ADC1_CH4).
     let spi = SpiDriver::new(
         peripherals.spi3,
-        peripherals.pins.gpio6, // SCK
-        peripherals.pins.gpio15, // MOSI (SDO)
+        peripherals.pins.gpio6,       // SCK
+        peripherals.pins.gpio15,      // MOSI (SDO)
         Some(peripherals.pins.gpio7), // MISO (SDI)
         &SpiDriverConfig::new(),
     )
@@ -746,6 +818,9 @@ fn main() {
     ];
     let mut total_cents: u64 = 0;
     let mut items: u32 = 0;
+    // Libellé du panier pour le journal : le premier article ajouté (le nombre
+    // total d'articles est préfixé au moment de l'encaissement).
+    let mut cart_label = String::new();
     let mut calc_mode = false;
     // État calculatrice
     let mut acc: f64 = 0.0;
@@ -756,13 +831,20 @@ fn main() {
     let mut just_eq = false;
     println!("[POS] menu prêt");
 
-    // PIN admin du portail web : affiché 4 s au boot (aussi en serial).
+    // Accès admin : PIN du portail + mot de passe WPA2 de l'AP, affichés 6 s au
+    // boot (aussi en serial). Tout est centré : à l'échelle 3, « PIN ADMIN:
+    // 123456 » mesurait 306 px et débordait des 320 px de l'écran — les
+    // derniers chiffres du PIN étaient coupés.
     let pin = admin::ensure_pin(web::cfg_nvs());
-    println!("[ADMIN] pin={pin}");
+    println!("[ADMIN] pin={pin}  ap={ap_ssid} mdp={ap_pass}");
     display.clear(BG);
-    display.draw_text_scaled(&format!("PIN ADMIN: {pin}"), 40, 210, 3, AMBER);
+    display.text_center("ACCES ADMIN", 140, 2, 2, TXT_MUTED);
+    display.text_center(&format!("PIN {pin}"), 178, 3, 2, AMBER);
+    display.text_center("WIFI DU POS", 250, 1, 2, TXT_MUTED);
+    display.text_center(&ap_ssid, 274, 1, 1, TXT_DIM);
+    display.text_center(&ap_pass, 300, 2, 2, MINT);
     display.flush();
-    std::thread::sleep(Duration::from_millis(4000));
+    std::thread::sleep(Duration::from_millis(6000));
 
     /// Dessine l'écran courant (menu ou calculatrice) avec le thème cosmique.
     fn draw_ui(
@@ -786,7 +868,16 @@ fn main() {
             let pending = op.map(|o| (acc, o));
             ui::calc(d, &CALC_KEYS, &s, pending);
         } else {
-            ui::menu(d, products, page, total_cents, items, batt_pct, rssi, cur_code);
+            ui::menu(
+                d,
+                products,
+                page,
+                total_cents,
+                items,
+                batt_pct,
+                rssi,
+                cur_code,
+            );
         }
     }
 
@@ -949,11 +1040,18 @@ fn main() {
                         frac = 0;
                     }
                     "OK" => {
-                        let v = if let Some(o) = op { apply(acc, o, cur) } else { cur };
+                        let v = if let Some(o) = op {
+                            apply(acc, o, cur)
+                        } else {
+                            cur
+                        };
                         let cents = (v * 100.0).round() as i64;
                         if cents > 0 {
                             total_cents += cents as u64;
                             items += 1;
+                            if cart_label.is_empty() {
+                                cart_label = "MONTANT LIBRE".to_string();
+                            }
                             println!("[POS] +calcul {} cents", cents);
                         }
                         calc_mode = false;
@@ -1009,6 +1107,7 @@ fn main() {
                 } else if x >= CLEAR_X_MIN {
                     total_cents = 0;
                     items = 0;
+                    cart_label.clear();
                     println!("[POS] vente annulée");
                 }
             } else if y >= GRID_Y {
@@ -1034,15 +1133,33 @@ fn main() {
                         let p = &products[base + slot];
                         total_cents += p.cents as u64;
                         items += 1;
+                        if cart_label.is_empty() {
+                            cart_label = p.name.clone();
+                        }
                         println!("[POS] +{} ({} cents)", p.name, p.cents);
                     }
                     1 => {
                         page = if page == 0 { 1 } else { 0 };
                     }
                     _ => {
-                        if pay(&mut display, &mut touch, &mut rc522, total_cents, btc_price_cents, web::journal_nvs()) {
+                        // Libellé du journal : « 3x BIERE » pour un panier
+                        // multi-articles, le nom seul pour un article unique.
+                        let label = if items > 1 {
+                            format!("{items}x {cart_label}")
+                        } else {
+                            cart_label.clone()
+                        };
+                        if pay(
+                            &mut display,
+                            &mut touch,
+                            &mut rc522,
+                            total_cents,
+                            &label,
+                            web::journal_nvs(),
+                        ) {
                             total_cents = 0;
                             items = 0;
+                            cart_label.clear();
                             println!("[POS] vente encaissée, panier vidé");
                         }
                     }
@@ -1054,8 +1171,42 @@ fn main() {
         if calc_mode != old_calc_mode {
             ui::crossfade(
                 &mut display,
-                |d| draw_ui(d, old_calc_mode, &products, page, total_cents, items, batt_pct, rssi, &cur_code, cur, has_dot, frac, op, acc),
-                |d| draw_ui(d, calc_mode, &products, page, total_cents, items, batt_pct, rssi, &cur_code, cur, has_dot, frac, op, acc),
+                |d| {
+                    draw_ui(
+                        d,
+                        old_calc_mode,
+                        &products,
+                        page,
+                        total_cents,
+                        items,
+                        batt_pct,
+                        rssi,
+                        &cur_code,
+                        cur,
+                        has_dot,
+                        frac,
+                        op,
+                        acc,
+                    )
+                },
+                |d| {
+                    draw_ui(
+                        d,
+                        calc_mode,
+                        &products,
+                        page,
+                        total_cents,
+                        items,
+                        batt_pct,
+                        rssi,
+                        &cur_code,
+                        cur,
+                        has_dot,
+                        frac,
+                        op,
+                        acc,
+                    )
+                },
                 36,
             );
         }

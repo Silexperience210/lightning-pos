@@ -4,7 +4,7 @@
 //! l'enregistrement sur `/save` (POST application/x-www-form-urlencoded).
 
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use embedded_svc::http::server::Connection as HttpConnection;
 use embedded_svc::http::{headers::content_type, Headers, Method};
@@ -50,8 +50,10 @@ static JOURNAL: OnceLock<EspDefaultNvs> = OnceLock::new();
 /// Handle NVS du namespace `poscfg` (URL + clé LNbits), ouvert une fois par [`start`].
 static CFG: OnceLock<EspDefaultNvs> = OnceLock::new();
 
-/// Compteur global de requêtes admin (timestamp, count), reset toutes les 60 s.
-static RATE_LIMIT: OnceLock<Mutex<(u64, u8)>> = OnceLock::new();
+/// Compteur global de requêtes admin (début de fenêtre, count), reset toutes
+/// les 60 s. L'horloge est monotone (`Instant`) : `SystemTime` recule quand
+/// SNTP règle l'horloge au boot, ce qui faisait paniquer la soustraction.
+static RATE_LIMIT: OnceLock<Mutex<(Instant, u8)>> = OnceLock::new();
 
 /// Accès au namespace `products` (doit être appelé après [`start`]).
 pub fn products_nvs() -> &'static EspDefaultNvs {
@@ -92,45 +94,130 @@ where
     Ok(String::from_utf8_lossy(&buf[..filled]).into_owned())
 }
 
-/// Extrait le PIN d'une requête (query `?pin=` ou corps urlencoded `pin=`)
-/// et retourne aussi le corps lu (utile pour les POST).
+/// Extrait le PIN du **corps** urlencoded d'un POST, et retourne aussi le corps
+/// lu (les handlers en ont besoin pour les autres champs).
+///
+/// Le PIN n'est plus jamais lu dans la query string : un `?pin=123456` finit
+/// dans l'historique du navigateur, dans le champ Referer des requêtes
+/// sortantes et dans les journaux de tout proxy sur le trajet. Les pages
+/// d'administration ne sont donc accessibles qu'en POST ; leur GET sert le
+/// formulaire de saisie du PIN.
 fn req_pin<C>(req: &mut esp_idf_svc::http::server::Request<C>) -> (String, String)
 where
     C: HttpConnection,
 {
-    let q = req.uri().split('?').nth(1).unwrap_or("").to_string();
+    let body = read_body(req).unwrap_or_default();
     let mut pin = String::new();
-    for pair in q.split('&') {
+    for pair in body.split('&') {
         if let Some(v) = pair.strip_prefix("pin=") {
             pin = url_decode(v);
-        }
-    }
-    let body = read_body(req).unwrap_or_default();
-    if pin.is_empty() {
-        for pair in body.split('&') {
-            if let Some(v) = pair.strip_prefix("pin=") {
-                pin = url_decode(v);
-            }
         }
     }
     (pin, body)
 }
 
+/// Échecs consécutifs de PIN + instant de déblocage (verrou temporaire).
+///
+/// En mémoire volontairement : l'état n'a pas à survivre à un reboot (seul
+/// quelqu'un ayant l'accès physique peut redémarrer le POS — il a alors déjà
+/// le PIN affiché à l'écran) et cela évite d'user la NVS à chaque tentative.
+static PIN_FAILS: OnceLock<Mutex<(u32, Option<Instant>)>> = OnceLock::new();
+
+/// Nombre d'échecs tolérés avant que le backoff ne s'enclenche.
+const PIN_FREE_TRIES: u32 = 5;
+
+/// Plafond du backoff (5 min) : au-delà, l'attente deviendrait un déni de
+/// service pour le commerçant lui-même.
+const PIN_MAX_BACKOFF_SECS: u64 = 300;
+
+fn pin_fails() -> &'static Mutex<(u32, Option<Instant>)> {
+    PIN_FAILS.get_or_init(|| Mutex::new((0, None)))
+}
+
+/// Secondes restantes de blocage, ou `None` si le PIN peut être tenté.
+fn pin_locked_for() -> Option<u64> {
+    let mut st = pin_fails().lock().unwrap();
+    match st.1 {
+        Some(until) => {
+            let now = Instant::now();
+            if now < until {
+                Some((until - now).as_secs() + 1)
+            } else {
+                st.1 = None;
+                None
+            }
+        }
+        None => None,
+    }
+}
+
+/// Enregistre un échec : au-delà de `PIN_FREE_TRIES`, bloque `2^n` secondes
+/// (plafonné). Le rate-limit global de 20 req/min laissait sinon ~28 000
+/// essais par jour, de quoi épuiser un PIN à 6 chiffres en quelques semaines
+/// — et bien plus vite en visant les PIN probables.
+fn pin_note_failure() {
+    let mut st = pin_fails().lock().unwrap();
+    st.0 = st.0.saturating_add(1);
+    if st.0 > PIN_FREE_TRIES {
+        let exp = (st.0 - PIN_FREE_TRIES).min(16);
+        let secs = (1u64 << exp).min(PIN_MAX_BACKOFF_SECS);
+        st.1 = Some(Instant::now() + Duration::from_secs(secs));
+    }
+}
+
+/// PIN correct : remet le compteur d'échecs à zéro.
+fn pin_note_success() {
+    let mut st = pin_fails().lock().unwrap();
+    st.0 = 0;
+    st.1 = None;
+}
+
+/// Contrôle d'accès d'une page admin.
+///
+/// Retourne `None` si le PIN est bon, sinon `(status, corps)` à renvoyer tel
+/// quel : 429 pendant le backoff, 403 + formulaire PIN sinon.
+fn pin_challenge(pin: &str, path: &str, preserve: &[(String, String)]) -> Option<(u16, String)> {
+    if let Some(secs) = pin_locked_for() {
+        return Some((
+            429,
+            format!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Bloqu&eacute;</title>\
+                 </head><body><h1>Trop de PIN erron&eacute;s</h1>\
+                 <p>R&eacute;essayez dans {secs} s.</p></body></html>"
+            ),
+        ));
+    }
+    if admin::check_pin(cfg_nvs(), pin) {
+        pin_note_success();
+        return None;
+    }
+    // Un PIN vide = première visite (le formulaire n'a pas encore été rempli) :
+    // ce n'est pas une tentative, elle ne doit pas déclencher le backoff.
+    if !pin.is_empty() {
+        pin_note_failure();
+    }
+    Some((403, render_pin_required(path, !pin.is_empty(), preserve)))
+}
+
+/// Vrai si le corps POST porte le champ `k` (distingue un vrai envoi de
+/// formulaire d'un simple POST issu de la page « PIN requis »).
+fn has_field(pairs: &[(String, String)], k: &str) -> bool {
+    pairs.iter().any(|(key, _)| key == k)
+}
+
 /// Vérifie le rate-limit global. Retourne `false` si la limite est dépassée.
 fn rate_limit_check(max: u8) -> bool {
     let mut rl = RATE_LIMIT
-        .get_or_init(|| Mutex::new((0, 0)))
+        .get_or_init(|| Mutex::new((Instant::now(), 0)))
         .lock()
         .unwrap();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    if now - rl.0 > 60 {
-        rl.0 = now;
+    if rl.0.elapsed() > Duration::from_secs(60) {
+        rl.0 = Instant::now();
         rl.1 = 0;
     }
-    rl.1 += 1;
+    // Saturation : au-delà de 255 requêtes dans la fenêtre, l'incrément
+    // déborderait et repasserait sous la limite.
+    rl.1 = rl.1.saturating_add(1);
     rl.1 <= max
 }
 
@@ -195,8 +282,7 @@ pub fn start(
     let _ = NVS.set(EspNvs::new(partition, "products", true).unwrap());
     let _ = JOURNAL.set(EspNvs::new(journal_partition, "journal", true).unwrap());
     let _ = CFG.set(EspNvs::new(cfg_partition, "poscfg", true).unwrap());
-    let mut server =
-        EspHttpServer::new(&Configuration::default()).map_err(|e: EspIOError| e.0)?;
+    let mut server = EspHttpServer::new(&Configuration::default()).map_err(|e: EspIOError| e.0)?;
 
     server.fn_handler("/", Method::Get, |req| -> Result<(), EspIOError> {
         let products = store::load(products_nvs());
@@ -214,10 +300,9 @@ pub fn start(
             return Ok(());
         }
         let (pin, body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let preserve = parse_all_pairs(&body);
-            let html = render_pin_required("/save", !pin.is_empty(), &preserve);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
+        let pairs = parse_all_pairs(&body);
+        if let Some((code, html)) = pin_challenge(&pin, "/save", &pairs) {
+            req.into_response(code, None, &[content_type("text/html; charset=utf-8")])?
                 .write_all(html.as_bytes())
                 .map(|_| ())?;
             return Ok(());
@@ -231,64 +316,71 @@ pub fn start(
             .map(|_| ())
     })?;
 
-    server.fn_handler("/config", Method::Get, |mut req| -> Result<(), EspIOError> {
-        let (pin, _body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let html = render_pin_required("/config", !pin.is_empty(), &[]);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
-                .write_all(html.as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
-        let html = render_config();
-        req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
-            .write_all(html.as_bytes())
-            .map(|_| ())
+    // Les pages d'administration n'existent qu'en POST (le PIN voyage dans le
+    // corps) : leur GET sert le formulaire de saisie du PIN.
+    server.fn_handler("/config", Method::Get, |req| -> Result<(), EspIOError> {
+        let html = render_pin_required("/config", false, &[]);
+        req.into_response(
+            403,
+            Some("Forbidden"),
+            &[content_type("text/html; charset=utf-8")],
+        )?
+        .write_all(html.as_bytes())
+        .map(|_| ())
     })?;
 
-    server.fn_handler("/config", Method::Post, |mut req| -> Result<(), EspIOError> {
-        if !rate_limit_check(20) {
-            req.into_status_response(429)?
-                .write_all(b"Trop de tentatives, reessayez dans 60 s.")
-                .map(|_| ())?;
-            return Ok(());
-        }
-        let (pin, body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let preserve = parse_all_pairs(&body);
-            let html = render_pin_required("/config", !pin.is_empty(), &preserve);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
-                .write_all(html.as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
+    server.fn_handler(
+        "/config",
+        Method::Post,
+        |mut req| -> Result<(), EspIOError> {
+            if !rate_limit_check(20) {
+                req.into_status_response(429)?
+                    .write_all(b"Trop de tentatives, reessayez dans 60 s.")
+                    .map(|_| ())?;
+                return Ok(());
+            }
+            let (pin, body) = req_pin(&mut req);
+            let pairs = parse_all_pairs(&body);
+            if let Some((code, html)) = pin_challenge(&pin, "/config", &pairs) {
+                req.into_response(code, None, &[content_type("text/html; charset=utf-8")])?
+                    .write_all(html.as_bytes())
+                    .map(|_| ())?;
+                return Ok(());
+            }
 
-        let (url, key, cur) = parse_config(&body);
-        if let Err(e) = config::save(cfg_nvs(), &url, &key, &cur) {
-            req.into_status_response(400)?
-                .write_all(format!("Erreur: {}", e).as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
+            // POST venant de la page « PIN requis » (aucun champ de config) : le PIN
+            // est bon, on sert le formulaire en y reportant le PIN.
+            if !has_field(&pairs, "url") {
+                let html = render_config(&pin);
+                req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
+                    .write_all(html.as_bytes())
+                    .map(|_| ())?;
+                return Ok(());
+            }
 
-        req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
-            .write_all(CONFIG_CONFIRM_HTML.as_bytes())
-            .map(|_| ())
-    })?;
+            let (url, key, cur) = parse_config(&body);
+            if let Err(e) = config::save(cfg_nvs(), &url, &key, &cur) {
+                req.into_status_response(400)?
+                    .write_all(format!("Erreur: {}", e).as_bytes())
+                    .map(|_| ())?;
+                return Ok(());
+            }
 
-    server.fn_handler("/wifi", Method::Get, |mut req| -> Result<(), EspIOError> {
-        let (pin, _body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let html = render_pin_required("/wifi", !pin.is_empty(), &[]);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
-                .write_all(html.as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
-        let html = render_wifi(&pin);
-        req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
-            .write_all(html.as_bytes())
-            .map(|_| ())
+            req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
+                .write_all(CONFIG_CONFIRM_HTML.as_bytes())
+                .map(|_| ())
+        },
+    )?;
+
+    server.fn_handler("/wifi", Method::Get, |req| -> Result<(), EspIOError> {
+        let html = render_pin_required("/wifi", false, &[]);
+        req.into_response(
+            403,
+            Some("Forbidden"),
+            &[content_type("text/html; charset=utf-8")],
+        )?
+        .write_all(html.as_bytes())
+        .map(|_| ())
     })?;
 
     server.fn_handler("/wifi", Method::Post, |mut req| -> Result<(), EspIOError> {
@@ -299,10 +391,9 @@ pub fn start(
             return Ok(());
         }
         let (pin, body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let preserve = parse_all_pairs(&body);
-            let html = render_pin_required("/wifi", !pin.is_empty(), &preserve);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
+        let pairs = parse_all_pairs(&body);
+        if let Some((code, html)) = pin_challenge(&pin, "/wifi", &pairs) {
+            req.into_response(code, None, &[content_type("text/html; charset=utf-8")])?
                 .write_all(html.as_bytes())
                 .map(|_| ())?;
             return Ok(());
@@ -310,7 +401,7 @@ pub fn start(
 
         // POST venant de la page « PIN requis » (aucun champ réseau) : le PIN
         // est bon, on sert le formulaire WiFi en y reportant le PIN.
-        if !body.contains("ssid=") && !body.contains("wifi=") {
+        if !has_field(&pairs, "ssid") && !has_field(&pairs, "wifi") {
             let html = render_wifi(&pin);
             req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
                 .write_all(html.as_bytes())
@@ -347,37 +438,97 @@ pub fn start(
         unsafe { esp_idf_sys::esp_restart() }
     })?;
 
-    server.fn_handler("/transactions", Method::Get, |mut req| -> Result<(), EspIOError> {
-        let (pin, _body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let html = render_pin_required("/transactions", !pin.is_empty(), &[]);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
-                .write_all(html.as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
-        let txs = journal::list(journal_nvs());
-        let html = render_transactions(&txs);
-        req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
+    server.fn_handler(
+        "/transactions",
+        Method::Get,
+        |req| -> Result<(), EspIOError> {
+            let html = render_pin_required("/transactions", false, &[]);
+            req.into_response(
+                403,
+                Some("Forbidden"),
+                &[content_type("text/html; charset=utf-8")],
+            )?
             .write_all(html.as_bytes())
             .map(|_| ())
-    })?;
+        },
+    )?;
 
-    server.fn_handler("/transactions.csv", Method::Get, |mut req| -> Result<(), EspIOError> {
-        let (pin, _body) = req_pin(&mut req);
-        if !admin::check_pin(cfg_nvs(), &pin) {
-            let html = render_pin_required("/transactions.csv", !pin.is_empty(), &[]);
-            req.into_response(403, Some("Forbidden"), &[content_type("text/html; charset=utf-8")])?
+    server.fn_handler(
+        "/transactions",
+        Method::Post,
+        |mut req| -> Result<(), EspIOError> {
+            if !rate_limit_check(20) {
+                req.into_status_response(429)?
+                    .write_all(b"Trop de tentatives, reessayez dans 60 s.")
+                    .map(|_| ())?;
+                return Ok(());
+            }
+            let (pin, body) = req_pin(&mut req);
+            let pairs = parse_all_pairs(&body);
+            if let Some((code, html)) = pin_challenge(&pin, "/transactions", &pairs) {
+                req.into_response(code, None, &[content_type("text/html; charset=utf-8")])?
+                    .write_all(html.as_bytes())
+                    .map(|_| ())?;
+                return Ok(());
+            }
+            let txs = journal::list(journal_nvs());
+            let html = render_transactions(&txs, &pin);
+            req.into_response(200, Some("OK"), &[content_type("text/html; charset=utf-8")])?
                 .write_all(html.as_bytes())
-                .map(|_| ())?;
-            return Ok(());
-        }
-        let txs = journal::list(journal_nvs());
-        let csv = render_transactions_csv(&txs);
-        req.into_response(200, Some("OK"), &[content_type("text/csv; charset=utf-8")])?
+                .map(|_| ())
+        },
+    )?;
+
+    server.fn_handler(
+        "/transactions.csv",
+        Method::Get,
+        |req| -> Result<(), EspIOError> {
+            let html = render_pin_required("/transactions.csv", false, &[]);
+            req.into_response(
+                403,
+                Some("Forbidden"),
+                &[content_type("text/html; charset=utf-8")],
+            )?
+            .write_all(html.as_bytes())
+            .map(|_| ())
+        },
+    )?;
+
+    server.fn_handler(
+        "/transactions.csv",
+        Method::Post,
+        |mut req| -> Result<(), EspIOError> {
+            if !rate_limit_check(20) {
+                req.into_status_response(429)?
+                    .write_all(b"Trop de tentatives, reessayez dans 60 s.")
+                    .map(|_| ())?;
+                return Ok(());
+            }
+            let (pin, body) = req_pin(&mut req);
+            let pairs = parse_all_pairs(&body);
+            if let Some((code, html)) = pin_challenge(&pin, "/transactions.csv", &pairs) {
+                req.into_response(code, None, &[content_type("text/html; charset=utf-8")])?
+                    .write_all(html.as_bytes())
+                    .map(|_| ())?;
+                return Ok(());
+            }
+            let txs = journal::list(journal_nvs());
+            let csv = render_transactions_csv(&txs);
+            req.into_response(
+                200,
+                Some("OK"),
+                &[
+                    ("Content-Type", "text/csv; charset=utf-8"),
+                    (
+                        "Content-Disposition",
+                        "attachment; filename=\"transactions.csv\"",
+                    ),
+                ],
+            )?
             .write_all(csv.as_bytes())
             .map(|_| ())
-    })?;
+        },
+    )?;
 
     Ok(server)
 }
@@ -411,45 +562,144 @@ fn render_form(products: &[Product]) -> String {
     html
 }
 
+/// Champ caché reportant le PIN d'une page admin à la suivante (le PIN ne
+/// pouvant plus transiter par l'URL).
+fn hidden_pin(pin: &str) -> String {
+    if pin.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<input type=\"hidden\" name=\"pin\" value=\"{}\">",
+        html_escape(pin)
+    )
+}
+
 /// Construit la page HTML du journal des transactions.
-fn render_transactions(txs: &[journal::Tx]) -> String {
+fn render_transactions(txs: &[journal::Tx], pin: &str) -> String {
     let mut html = String::new();
     html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>LightningPoS — Transactions</title>");
     html.push_str(
         "<style>body{font-family:sans-serif;max-width:720px;margin:2em auto}\
-         table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px;text-align:left}</style>",
+         table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:4px;text-align:left}\
+         .hint{color:#666;font-size:0.9em}</style>",
     );
     html.push_str("</head><body><h1>Transactions</h1>");
-    html.push_str("<p><a href=\"/\">Produits</a> &middot; <a href=\"/transactions.csv\">Exporter CSV</a></p>");
+    // L'export CSV est un POST : il porte le PIN dans son corps.
+    html.push_str(&format!(
+        "<p><a href=\"/\">Produits</a> &middot; \
+         <form method=\"post\" action=\"/transactions.csv\" style=\"display:inline\">{}\
+         <input type=\"submit\" value=\"Exporter CSV\"></form></p>",
+        hidden_pin(pin)
+    ));
     if txs.is_empty() {
         html.push_str("<p>Aucune transaction pour l'instant.</p>");
     } else {
-        html.push_str("<table><tr><th>#</th><th>Temps (s)</th><th>EUR</th><th>sats</th><th>hash</th></tr>");
+        html.push_str(
+            "<table><tr><th>#</th><th>Date (UTC)</th><th>Libell&eacute;</th><th>Montant</th>\
+             <th>sats</th><th>hash</th></tr>",
+        );
         for tx in txs {
-            let eur = tx.cents as f64 / 100.0;
+            let montant = tx.cents as f64 / 100.0;
+            let cur = if tx.cur.is_empty() { "EUR" } else { &tx.cur };
             html.push_str(&format!(
-                "<tr><td>{}</td><td>+{}s</td><td>{eur:.2}</td><td>{}</td><td>{}</td></tr>",
-                tx.seq, tx.ts, tx.sats, html_escape(&tx.hash)
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{montant:.2} {}</td>\
+                 <td>{}</td><td>{}</td></tr>",
+                tx.seq,
+                html_escape(&fmt_ts(tx)),
+                html_escape(&tx.label),
+                html_escape(cur),
+                tx.sats,
+                html_escape(&tx.hash)
             ));
         }
         html.push_str("</table>");
+        html.push_str(
+            "<p class=\"hint\">Les dates « +Ns » sont relatives au d&eacute;marrage du POS \
+             (horloge non encore synchronis&eacute;e par SNTP).</p>",
+        );
     }
     html.push_str("</body></html>");
     html
 }
 
 /// Export CSV du journal (compatible tableur).
+///
+/// `datetime_utc` est vide quand l'horloge n'était pas synchronisée : la
+/// colonne `uptime_s` porte alors la valeur relative au boot, et `seq` reste
+/// la clé d'ordre fiable dans tous les cas.
 fn render_transactions_csv(txs: &[journal::Tx]) -> String {
-    let mut csv = String::from("seq,timestamp_s,eur_cents,sats,payment_hash\n");
+    let mut csv =
+        String::from("seq,datetime_utc,uptime_s,amount_cents,currency,label,sats,payment_hash\n");
     for tx in txs {
-        csv.push_str(&format!("{},{},{},{},{}\n", tx.seq, tx.ts, tx.cents, tx.sats, tx.hash));
+        let (dt, up) = if tx.epoch {
+            (fmt_ts(tx), String::new())
+        } else {
+            (String::new(), tx.ts.to_string())
+        };
+        let cur = if tx.cur.is_empty() { "EUR" } else { &tx.cur };
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            tx.seq,
+            dt,
+            up,
+            tx.cents,
+            cur,
+            csv_escape(&tx.label),
+            tx.sats,
+            tx.hash
+        ));
     }
     csv
 }
 
+/// Échappe une valeur CSV (virgule / guillemet / saut de ligne).
+fn csv_escape(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Horodatage lisible : date UTC si l'horloge était synchronisée, sinon
+/// l'uptime relatif au boot (`+123s`).
+fn fmt_ts(tx: &journal::Tx) -> String {
+    if !tx.epoch {
+        return format!("+{}s", tx.ts);
+    }
+    let (y, m, d, hh, mm, ss) = civil_from_epoch(tx.ts);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}")
+}
+
+/// Epoch UNIX (UTC) → (année, mois, jour, h, min, s).
+/// Algorithme `civil_from_days` de Howard Hinnant (ère de 400 ans) — évite
+/// d'embarquer une crate de dates pour la seule page du journal.
+fn civil_from_epoch(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (
+        y,
+        m,
+        d,
+        (rem / 3600) as u32,
+        ((rem % 3600) / 60) as u32,
+        (rem % 60) as u32,
+    )
+}
+
 /// Page de configuration : URL + clé API LNbits (clé affichée masquée).
 /// Champ clé vide = garder l'existante (elle n'est jamais renvoyée en clair).
-fn render_config() -> String {
+fn render_config(pin: &str) -> String {
     let url = config::load_url(cfg_nvs());
     let tail = config::key_tail(cfg_nvs());
     let mut html = String::new();
@@ -465,6 +715,7 @@ fn render_config() -> String {
          Les cartes Bolt Card, elles, suivent l'instance inscrite dans leur NDEF.</p>"
     ));
     html.push_str("<form method=\"post\" action=\"/config\">");
+    html.push_str(&hidden_pin(pin));
     html.push_str(&format!(
         "<label>URL LNbits</label><input type=\"text\" name=\"url\" value=\"{}\">",
         html_escape(&url)
@@ -485,7 +736,9 @@ fn render_config() -> String {
         selected_gbp = if cur == "GBP" { " selected" } else { "" },
     ));
     html.push_str("<br><br><input type=\"submit\" value=\"Enregistrer\"></form>");
-    html.push_str("<p><a href=\"/\">Produits</a> &middot; <a href=\"/transactions\">Transactions</a></p>");
+    html.push_str(
+        "<p><a href=\"/\">Produits</a> &middot; <a href=\"/transactions\">Transactions</a></p>",
+    );
     html.push_str("</body></html>");
     html
 }
@@ -497,7 +750,9 @@ fn render_wifi(pin: &str) -> String {
     let scan = wifi_cfg::scan_list();
     let ap = format!("LightningPoS-{}", wifi_cfg::ap_suffix());
     let mut html = String::new();
-    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>LightningPoS — WiFi</title>");
+    html.push_str(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>LightningPoS — WiFi</title>",
+    );
     html.push_str(
         "<style>body{font-family:sans-serif;max-width:640px;margin:2em auto}\
          label{display:block;margin:12px 0 4px}input[type=text],input[type=password],select{width:100%;padding:6px}\
@@ -509,12 +764,7 @@ fn render_wifi(pin: &str) -> String {
          Le POS red&eacute;marre apr&egrave;s l'enregistrement.</p>",
     );
     html.push_str("<form method=\"post\" action=\"/wifi\">");
-    if !pin.is_empty() {
-        html.push_str(&format!(
-            "<input type=\"hidden\" name=\"pin\" value=\"{}\">",
-            html_escape(pin)
-        ));
-    }
+    html.push_str(&hidden_pin(pin));
     if !scan.is_empty() {
         html.push_str("<label>R&eacute;seaux d&eacute;tect&eacute;s</label><select name=\"wifi\">");
         html.push_str("<option value=\"\">— réseau détecté —</option>");
@@ -535,12 +785,19 @@ fn render_wifi(pin: &str) -> String {
          placeholder=\"laisser vide si réseau ouvert\">",
     );
     html.push_str("<br><br><input type=\"submit\" value=\"Enregistrer et redémarrer\"></form>");
+    // Le mot de passe de l'AP est affiché ici : généré au premier boot, il
+    // n'apparaît sinon qu'à l'écran du POS pendant quelques secondes.
     html.push_str(&format!(
-        "<p class=\"hint\">Le point d'acc&egrave;s {} reste actif : le portail est aussi \
+        "<h2>Point d'acc&egrave;s du POS</h2>\
+         <p>R&eacute;seau : <b>{}</b><br>Mot de passe (WPA2) : <b><code>{}</code></b></p>\
+         <p class=\"hint\">Le point d'acc&egrave;s reste actif : le portail est aussi \
          joignable sur <a href=\"http://192.168.4.1\">http://192.168.4.1</a></p>",
-        html_escape(&ap)
+        html_escape(&ap),
+        html_escape(&wifi_cfg::ap_pass())
     ));
-    html.push_str("<p><a href=\"/\">Produits</a> &middot; <a href=\"/config\">Configuration LNbits</a></p>");
+    html.push_str(
+        "<p><a href=\"/\">Produits</a> &middot; <a href=\"/config\">Configuration LNbits</a></p>",
+    );
     html.push_str("</body></html>");
     html
 }
@@ -619,18 +876,16 @@ fn url_decode(s: &str) -> String {
                 out.push(b' ');
                 i += 1;
             }
-            b'%' if i + 2 < bytes.len() => {
-                match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                    (Some(hi), Some(lo)) => {
-                        out.push(hi * 16 + lo);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(b'%');
-                        i += 1;
-                    }
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi * 16 + lo);
+                    i += 3;
                 }
-            }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
             b => {
                 out.push(b);
                 i += 1;

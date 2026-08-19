@@ -40,6 +40,17 @@ jobs:
           path: firmware-espidf/target/xtensa-esp32s3-espidf/release/firmware-espidf
           if-no-files-found: error
 
+  # ─── Format check ───────────────────────────────────────────────
+  fmt:
+    name: Format check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo fmt --check
+        working-directory: firmware-espidf
+        run: cargo fmt --all -- --check
+
   # ─── Security audit ───────────────────────────────────────────────
   security-audit:
     name: Security Audit

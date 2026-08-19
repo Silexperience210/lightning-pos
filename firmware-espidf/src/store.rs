@@ -19,8 +19,8 @@ pub struct Product {
 
 /// Noms par défaut (ASCII majuscule pour la fonte 5×7 embarquée).
 const DEFAULT_NAMES: [&str; NUM_PRODUCTS] = [
-    "BIERE", "VIN", "CAFE", "SODA", "PUNCH", "TSHIRT", "GOODIES", "EAU", "JUS", "THE",
-    "COCKTAIL", "BURGER", "FRITES", "DESSERT", "MENU",
+    "BIERE", "VIN", "CAFE", "SODA", "PUNCH", "TSHIRT", "GOODIES", "EAU", "JUS", "THE", "COCKTAIL",
+    "BURGER", "FRITES", "DESSERT", "MENU",
 ];
 
 /// Prix par défaut, en centimes.

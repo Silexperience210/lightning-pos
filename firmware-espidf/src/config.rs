@@ -8,11 +8,13 @@
 
 use esp_idf_svc::nvs::EspDefaultNvs;
 
-use crate::secrets;
-
 const KEY_URL: &str = "lnbits_url";
 const KEY_API: &str = "lnbits_key";
 const KEY_CUR: &str = "currency";
+
+/// URL LNbits proposée tant que rien n'a été configuré via `/config`.
+/// Ce n'est pas un secret : juste une valeur de départ, remplaçable au portail.
+const DEFAULT_LNBITS_URL: &str = "http://192.168.1.176:3007";
 
 /// Longueur maximale autorisée pour l'URL LNbits (portail /config).
 pub const MAX_URL_LEN: usize = 256;
@@ -30,24 +32,26 @@ pub fn load_currency(nvs: &EspDefaultNvs) -> String {
         .unwrap_or_else(|| "EUR".to_string())
 }
 
-/// URL de l'instance LNbits (défaut : `secrets::LNBITS_URL`).
+/// URL de l'instance LNbits (défaut : [`DEFAULT_LNBITS_URL`]).
 pub fn load_url(nvs: &EspDefaultNvs) -> String {
     let mut buf = [0u8; 256];
     nvs.get_str(KEY_URL, &mut buf)
         .ok()
         .flatten()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| secrets::LNBITS_URL.to_string())
+        .unwrap_or_else(|| DEFAULT_LNBITS_URL.to_string())
 }
 
-/// Clé API LNbits (défaut : `secrets::LNBITS_KEY`).
+/// Clé API LNbits. Aucune valeur par défaut : la clé se provisionne au portail
+/// `/config` et n'existe qu'en NVS — le binaire ne contient aucun secret, et
+/// aucune constante compilée ne peut plus en réintroduire un par inadvertance.
 pub fn load_key(nvs: &EspDefaultNvs) -> String {
     let mut buf = [0u8; 128];
     nvs.get_str(KEY_API, &mut buf)
         .ok()
         .flatten()
         .map(|s| s.to_string())
-        .unwrap_or_else(|| secrets::LNBITS_KEY.to_string())
+        .unwrap_or_default()
 }
 
 /// Derniers 4 caractères de la clé (affichage masqué dans le portail web).

@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""
+LightningPoS POS terminal enclosure v2 - FLAT design.
+
+Remplace le design wedge par un terminal plat posé sur le comptoir :
+  - écran 320×480 PORTRAIT à fleur sur la face supérieure
+  - rebord de protection autour de l'écran
+  - PCB vissé sur 4 plots M2.5
+  - RC522 sous le boîtier, bobine lisant à travers la face inférieure
+  - batterie dans le volume sous la carte, maintenue par la porte
+  - porte batterie clipsée en dessous
+  - FDM sans supports, imprimé à plat (corps face inférieure sur le bed,
+    porte à plat, texture honeycomb sur les faces non fonctionnelles)
+
+Run:  blender --background --python gen_v2.py
+      blender --background --python gen_v2.py -- --preview   (rendus preview.png + preview_front.png)
+      blender --background --python gen_v2.py -- --section   (coupe section.png)
+
+Outputs (dans le dossier du script) :
+    body.stl           corps principal
+    battery_door.stl   porte batterie clipsée
+
+Toutes les cotes sont en millimètres (1 unité Blender = 1 mm).
+"""
+
+import math
+import os
+import sys
+
+import bmesh
+import bpy
+from mathutils import Vector
+
+# =====================================================================
+#  CONSTANTS  -- ajuster ici
+# =====================================================================
+
+OUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---- jeu général -----------------------------------------------------
+CLEAR = 0.3           # jeu FDM par face sur les cavités composants
+
+# ---- enveloppe extérieure --------------------------------------------
+LIP = 5.5             # marge plastique autour du PCB (détermine W/D)
+H = 22.0              # hauteur totale du corps (hors porte batterie)
+WALL = 2.0            # épaisseur des parois verticales
+TOP_WALL = 2.2        # épaisseur de la face supérieure (égale à FRAME_DEPTH)
+BOT_WALL = 1.5        # épaisseur de la face inférieure sous la bobine NFC
+FILLET = 4.0          # rayon d'arrondi des coins extérieurs
+FILLET_SEG = 8        # segments de l'arrondi
+
+# ---- PCB JC3248W535C (ESP32-S3, écran 3.5" 320×480 portrait) ---------
+PCB_W = 59.0          # largeur PCB (X)  -- portrait : petit côté
+PCB_L = 91.0          # longueur PCB (Y) -- portrait : grand côté
+PCB_T = 10.6          # déport total écran → butée des vis (mesuré)
+SCREEN_AW = 49.0      # largeur zone active de l'écran
+SCREEN_AL = 73.5      # hauteur zone active de l'écran
+
+# ---- cadre verre de l'écran ------------------------------------------
+SCREEN_FRAME_W = 63.5 # largeur cadre verre (63 mm + 0.5 jeu)
+SCREEN_FRAME_L = 95.5 # longueur cadre verre (95 mm + 0.5 jeu)
+FRAME_DEPTH = 2.2     # profondeur de la poche (cadre LCD 2.4 mm - marge)
+
+# ---- vissage chassis -------------------------------------------------
+SCREW_D = 2.5         # diamètre filetage M2.5
+SCREW_CLEARANCE_D = 3.2  # diamètre trou de passage M2.5
+SCREW_OFFSET = 4.0    # distance centre trou → bord PCB (info, non utilisé)
+BOSS_D = 6.0          # diamètre colonne de vissage
+SCREW_COUNTERBORE_D = 6.0   # diamètre fraisage tête de vis
+SCREW_COUNTERBORE_DEPTH = 1.0  # profondeur fraisage tête de vis
+BOSS_RELIEF_D = 8.0   # diamètre dégagement autour du trou côté PCB
+BOSS_RELIEF_DEPTH = 1.0  # profondeur dégagement côté PCB
+
+# ---- RC522 NFC -------------------------------------------------------
+NFC_W = 60.0          # largeur module (X)
+NFC_L = 40.0          # longueur module (Y)
+NFC_T = 3.0           # épaisseur module
+NFC_SKIN = 1.5        # plastique sous la bobine (≤ 1.5 mm)
+NFC_CLEAR = 0.5       # jeu supplémentaire autour du module
+
+# ---- batterie LiPo ---------------------------------------------------
+BAT_W = 50.0          # largeur batterie
+BAT_L = 34.0          # longueur batterie
+BAT_T = 5.0           # épaisseur batterie
+BAT_RIB_H = 2.0       # hauteur des nervures de maintien
+
+# ---- USB-C -----------------------------------------------------------
+USB_W = 13.0          # largeur ouverture
+USB_H = 5.5           # hauteur ouverture
+
+# ---- porte batterie --------------------------------------------------
+DOOR_T = 2.0          # épaisseur du fond de la porte
+DOOR_LIP_H = 4.0      # hauteur de la jupe périphérique qui rentre dans le corps
+DOOR_CLEAR = 0.25     # jeu entre porte et corps
+# Ouverture porte dans le fond du corps : bande y (zone batterie). La porte
+# couvre y DOOR_OPEN_Y0+CLEAR .. DOOR_OPEN_Y1-CLEAR ; les vis AVANT restent
+# dans le fond plein du corps (poche NFC), seules les vis ARRIÈRE traversent.
+DOOR_OPEN_Y0 = 2.5
+DOOR_OPEN_Y1 = 46.5
+DETENT_D = 0.6        # profondeur de l'encoche dans le corps
+DETENT_PROUD = 0.45   # hauteur du renflement sur la porte
+DETENT_LEN = 12.0     # longueur du clip
+DOOR_R = 1.75         # rayon d'arrondi des coins de la porte (SANS bevel)
+
+# ---- honeycomb texture -----------------------------------------------
+HONEY_W = 4.0         # largeur d'un hexagone
+HONEY_DEPTH = 0.35    # profondeur de gravure
+HONEY_MARGIN = 2.0    # marge autour des zones fonctionnelles
+
+# =====================================================================
+#  DERIVED
+# =====================================================================
+
+W = PCB_W + 2 * LIP
+D = PCB_L + 2 * LIP
+
+#  boîte extérieure
+X0, X1 = -W / 2.0, W / 2.0
+Y0, Y1 = -D / 2.0, D / 2.0
+Z0, Z1 = 0.0, H
+
+#  cavités intérieures
+IX0, IX1 = X0 + WALL, X1 - WALL
+IY0, IY1 = Y0 + WALL, Y1 - WALL
+IZ0 = Z0 + BOT_WALL
+IZ1 = Z1 - TOP_WALL
+
+#  PCB : sa face arrière repose sur les plots à Z1 - PCB_T ;
+#        sa face avant (sous le verre) est à IZ1.
+PCB_Z_TOP = IZ1
+PCB_Z_BOT = Z1 - PCB_T
+
+#  ouverture écran (zone active) dans le dessus
+SX0 = -SCREEN_AW / 2.0
+SX1 = SCREEN_AW / 2.0
+SY0 = -SCREEN_AL / 2.0
+SY1 = SCREEN_AL / 2.0
+
+#  poche du cadre verre dans la face supérieure
+FX0 = -SCREEN_FRAME_W / 2.0
+FX1 = SCREEN_FRAME_W / 2.0
+FY0 = -SCREEN_FRAME_L / 2.0
+FY1 = SCREEN_FRAME_L / 2.0
+FRAME_Z_TOP = Z1
+FRAME_Z_BOT = Z1 - FRAME_DEPTH
+
+#  position des trous de vissage (mesurés au pied à coulisse)
+SCREW_X = 26.75
+SCREW_Y = 42.5
+
+#  position RC522 : face inférieure, côté client (Y négatif).
+#  NFC_Y=-19 (et non -22.5) : les 2 colonnes de vis AVANT (±26.75, -42.5)
+#  sont dans l'empreinte du module 60×40 à -22.5 → le module ne rentrait
+#  pas dans la poche. À -19 le module couvre y -39..+1, derrière les
+#  colonnes (qui finissent à y=-39.5) et devant l'ouverture porte (y≥2.5).
+NFC_X = 0.0
+NFC_Y = -(D / 2.0 - NFC_L / 2.0 - LIP - NFC_CLEAR) + 3.5
+NFC_Z_FLOOR = Z0 + NFC_SKIN
+NFC_Z_CEIL = NFC_Z_FLOOR + NFC_T + NFC_CLEAR
+
+#  position batterie : face inférieure, côté arrière (Y positif).
+#  Reculée pour garder un dégagement avec les vis arrière (y=+42.5) :
+#  batterie max y ≈ 41.5.
+BAT_X = 0.0
+BAT_Y = (D / 2.0 - BAT_L / 2.0 - LIP - NFC_CLEAR) - 3.5
+
+#  USB-C : au milieu de l'arrière (Y positif)
+USB_Y = Y1
+USB_Z_BOT = PCB_Z_BOT + 1.0
+USB_Z_TOP = USB_Z_BOT + USB_H
+
+# =====================================================================
+#  MESH HELPERS
+# =====================================================================
+
+
+def _link(name, verts, faces):
+    me = bpy.data.meshes.new(name)
+    me.from_pydata(verts, [], faces)
+    me.validate()
+    ob = bpy.data.objects.new(name, me)
+    bpy.context.collection.objects.link(ob)
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(me)
+    bm.free()
+    return ob
+
+
+def box(name, x0, x1, y0, y1, z0, z1):
+    verts = [
+        (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+        (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+    ]
+    faces = [
+        [0, 1, 2, 3], [4, 7, 6, 5],
+        [0, 4, 5, 1], [1, 5, 6, 2], [2, 6, 7, 3], [3, 7, 4, 0],
+    ]
+    return _link(name, verts, faces)
+
+
+def cyl(name, r, x, y, z0, z1, seg=64):
+    verts = []
+    for i in range(seg):
+        a = 2 * math.pi * i / seg
+        verts.append((x + r * math.cos(a), y + r * math.sin(a), z0))
+    for i in range(seg):
+        a = 2 * math.pi * i / seg
+        verts.append((x + r * math.cos(a), y + r * math.sin(a), z1))
+    faces = [list(range(seg))[::-1], list(range(seg, 2 * seg))]
+    for i in range(seg):
+        j = (i + 1) % seg
+        faces.append([i, j, seg + j, seg + i])
+    return _link(name, verts, faces)
+
+
+def rounded_box(name, x0, x1, y0, y1, z0, z1, radius, seg=8):
+    """Cube avec arrondi sur les arêtes verticales (axe Z)."""
+    ob = box(name, x0, x1, y0, y1, z0, z1)
+    m = ob.modifiers.new("bevel", 'BEVEL')
+    m.width = radius
+    m.segments = seg
+    m.limit_method = 'ANGLE'
+    m.angle_limit = math.radians(89.0)  # presque toutes les arêtes vives
+    m.miter_outer = 'MITER_ARC'
+    try:
+        m.clamp_overlap = True
+    except AttributeError:
+        pass
+    bpy.context.view_layer.objects.active = ob
+    bpy.ops.object.modifier_apply(modifier=m.name)
+    return ob
+
+
+def rounded_plate(name, x0, x1, y0, y1, z0, z1, r):
+    """Plaque à coins arrondis SANS bevel : box + 4 cylindres de coin.
+
+    Le bevel de rounded_box GONFLE le bbox (~0.5 mm) et fait déborder les
+    pièces emboîtées ; ici le bbox reste exactement x0..x1 × y0..y1, les
+    cylindres sont tangents aux bords. Coin = rayon r.
+    """
+    ob = box(name, x0, x1, y0, y1, z0, z1)
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cx = (x0 if sx < 0 else x1) - sx * r
+            cy = (y0 if sy < 0 else y1) - sy * r
+            boolean(ob, cyl(f"{name}_corner_{sx}_{sy}", r, cx, cy, z0, z1, seg=24),
+                    'UNION')
+    return ob
+
+
+def _apply(ob, mod):
+    bpy.context.view_layer.objects.active = ob
+    bpy.ops.object.modifier_apply(modifier=mod.name)
+
+
+def boolean(target, cutter, op='DIFFERENCE'):
+    m = target.modifiers.new(f"bool_{cutter.name}", 'BOOLEAN')
+    m.operation = op
+    m.object = cutter
+    m.solver = 'EXACT'
+    _apply(target, m)
+    bpy.data.objects.remove(cutter, do_unlink=True)
+    return target
+
+
+def bbox(ob):
+    vs = [ob.matrix_world @ v.co for v in ob.data.vertices]
+    lo = Vector((min(v.x for v in vs), min(v.y for v in vs), min(v.z for v in vs)))
+    hi = Vector((max(v.x for v in vs), max(v.y for v in vs), max(v.z for v in vs)))
+    return lo, hi
+
+
+def tri_count(ob):
+    return sum(len(p.vertices) - 2 for p in ob.data.polygons)
+
+# =====================================================================
+#  HONEYCOMB HELPERS
+# =====================================================================
+
+
+def hex_cell(cx, cy, r, z0, z1):
+    """Hexagone régulier, rayon circonscrit r, extrudé de z0 à z1."""
+    verts = []
+    for i in range(6):
+        a = math.radians(60 * i)
+        verts.append((cx + r * math.cos(a), cy + r * math.sin(a), z0))
+    for i in range(6):
+        a = math.radians(60 * i)
+        verts.append((cx + r * math.cos(a), cy + r * math.sin(a), z1))
+    faces = [list(range(6))[::-1], list(range(6, 12))]
+    for i in range(6):
+        j = (i + 1) % 6
+        faces.append([i, j, 6 + j, 6 + i])
+    return verts, faces
+
+
+def honeycomb_on_top(name, z_base, x0, x1, y0, y1, exclude_rects, r, depth):
+    """Grille hexagonale gravée sur une face horizontale (Z+).
+    exclude_rects : liste de (x0,x1,y0,y1) à laisser lisses."""
+    cells = []
+    dx = 3 * r
+    dy = r * math.sqrt(3)
+    margin = r * 0.15
+    row = 0
+    y = y0 + dy
+    while y < y1 - dy:
+        x = x0 + dx + (0 if row % 2 == 0 else 1.5 * r)
+        while x < x1 - dx:
+            # zone interne de l'hexagone (marge pour éviter les micro-parois)
+            ok = True
+            for ex0, ex1, ey0, ey1 in exclude_rects:
+                if (ex0 - margin <= x <= ex1 + margin and
+                        ey0 - margin <= y <= ey1 + margin):
+                    ok = False
+                    break
+            if ok:
+                cells.append((x, y))
+            x += dx
+        y += dy
+        row += 1
+
+    # construire un seul mesh pour tous les hexagones (plus rapide aux booléens)
+    all_verts = []
+    all_faces = []
+    for x, y in cells:
+        v, f = hex_cell(x, y, r, z_base, z_base + depth)
+        off = len(all_verts)
+        all_verts.extend(v)
+        for face in f:
+            all_faces.append([i + off for i in face])
+    if not all_verts:
+        return None
+    return _link(name, all_verts, all_faces)
+
+
+def honeycomb_on_side(name, axis, fixed, z0, z1, t0, t1,
+                      exclude_rects, r, depth, inward=True):
+    """Grille hexagonale gravée sur une face verticale.
+    axis : 'X' ou 'Y' (face perpendiculaire à cet axe)
+    fixed : coordonnée X ou Y constante de la face
+    t0,t1 : intervalle le long de l'autre axe horizontal
+    exclude_rects : rectangles (t0,t1,z0,z1) à laisser lisses."""
+    cells = []
+    dx = 3 * r
+    dy = r * math.sqrt(3)
+    margin = r * 0.15
+    row = 0
+    z = z0 + dy
+    while z < z1 - dy:
+        t = t0 + dx + (0 if row % 2 == 0 else 1.5 * r)
+        while t < t1 - dx:
+            ok = True
+            for et0, et1, ez0, ez1 in exclude_rects:
+                if (et0 - margin <= t <= et1 + margin and
+                        ez0 - margin <= z <= ez1 + margin):
+                    ok = False
+                    break
+            if ok:
+                cells.append((t, z))
+            t += dx
+        z += dy
+        row += 1
+
+    all_verts = []
+    all_faces = []
+    sign = -1 if inward else 1
+    for t, zc in cells:
+        # hexagone dans le plan (t, z) ; extrusion selon normal ± de l'axe
+        base = []
+        for i in range(6):
+            a = math.radians(60 * i)
+            p_t = t + r * math.cos(a)
+            p_z = zc + r * math.sin(a)
+            if axis == 'X':
+                base.append((fixed, p_t, p_z))
+            else:
+                base.append((p_t, fixed, p_z))
+        for v in base:
+            all_verts.append(v)
+        for v in base:
+            if axis == 'X':
+                all_verts.append((v[0] + sign * depth, v[1], v[2]))
+            else:
+                all_verts.append((v[0], v[1] + sign * depth, v[2]))
+        off = len(all_verts) - 12
+        all_faces.append([off + i for i in range(6)][::-1])
+        all_faces.append([off + 6 + i for i in range(6)])
+        for i in range(6):
+            j = (i + 1) % 6
+            all_faces.append([off + i, off + j, off + 6 + j, off + 6 + i])
+
+    if not all_verts:
+        return None
+    return _link(name, all_verts, all_faces)
+
+
+# =====================================================================
+#  BUILD: BODY
+# =====================================================================
+
+def build_body():
+    # --- coque extérieure arrondie -------------------------------------
+    body = rounded_box("body", X0, X1, Y0, Y1, Z0, Z1, FILLET, FILLET_SEG)
+
+    cutters = []
+
+    # --- cavité intérieure ---------------------------------------------
+    cutters.append(box("cavity", IX0, IX1, IY0, IY1, IZ0, IZ1 + 0.1))
+
+    # --- poche du cadre verre + ouverture active au fond ----------------
+    # L'écran a des coins arrondis : on utilise rounded_plate (box + coins
+    # cylindriques) pour soustraire la poche ET la fenêtre active.
+    cutters.append(rounded_plate("screen_pocket", FX0, FX1, FY0, FY1,
+                                 FRAME_Z_BOT, Z1 + 1.0, 4.0))
+    cutters.append(rounded_plate("screen_window", SX0, SX1, SY0, SY1,
+                                 IZ1 - 0.1, Z1 + 1.0, 4.0))
+
+    # --- poche NFC dans la face inférieure ------------------------------
+    nx0 = NFC_X - NFC_W / 2.0 - NFC_CLEAR
+    nx1 = NFC_X + NFC_W / 2.0 + NFC_CLEAR
+    ny0 = NFC_Y - NFC_L / 2.0 - NFC_CLEAR
+    ny1 = NFC_Y + NFC_L / 2.0 + NFC_CLEAR
+    nfc_pocket = box("nfc_pocket", nx0, nx1, ny0, ny1, NFC_Z_FLOOR, NFC_Z_CEIL)
+    # dégagement pour les colonnes de vissage qui traversent cette zone
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cx = sx * SCREW_X
+            cy = sy * SCREW_Y
+            col = cyl(f"nfc_screw_relief_{sx}_{sy}", BOSS_D / 2.0 + 0.4,
+                      cx, cy, NFC_Z_FLOOR - 0.1, NFC_Z_CEIL + 0.1, seg=32)
+            boolean(nfc_pocket, col, 'DIFFERENCE')
+    cutters.append(nfc_pocket)
+
+    # --- ouverture porte batterie dans le fond --------------------------
+    # Bande y = DOOR_OPEN_Y0..DOOR_OPEN_Y1 sur toute la largeur intérieure,
+    # de z = -0.1 jusqu'à la hauteur de la jupe de la porte.
+    # Les colonnes arrière et leurs pastilles d'ancrage sont ajoutées PLUS
+    # TARD en union positive : elles ne sont donc pas enlevées par ce fraisage.
+    door_open = box("door_open", IX0 - 0.1, IX1 + 0.1,
+                    DOOR_OPEN_Y0, DOOR_OPEN_Y1, Z0 - 0.1, DOOR_LIP_H)
+    cutters.append(door_open)
+
+    # --- encoche USB-C sur l'arrière ------------------------------------
+    cutters.append(box("usb", -USB_W / 2.0, USB_W / 2.0,
+                       Y1 - WALL - 0.1, Y1 + 2.0,
+                       USB_Z_BOT, USB_Z_TOP))
+
+    # --- texture honeycomb sur le dessus --------------------------------
+    top_honey = honeycomb_on_top(
+        "honey_top", Z1 - HONEY_DEPTH,
+        X0 + HONEY_MARGIN, X1 - HONEY_MARGIN,
+        Y0 + HONEY_MARGIN, Y1 - HONEY_MARGIN,
+        [(SX0 - 1.0, SX1 + 1.0, SY0 - 1.0, SY1 + 1.0)],
+        HONEY_W / 2.0, HONEY_DEPTH)
+    if top_honey:
+        cutters.append(top_honey)
+
+    # texture sur les 4 faces verticales (hors zones USB/vis/ouvertures)
+    side_excludes = [
+        (-USB_W / 2.0 - 2.0, USB_W / 2.0 + 2.0, USB_Z_BOT - 2.0, USB_Z_TOP + 2.0),
+    ]
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            side_excludes.append((
+                sx * SCREW_X - 5.0, sx * SCREW_X + 5.0,
+                IZ0, IZ1))
+    for wall in (
+        ('X', X0, Y0 + WALL, Y1 - WALL, IZ0 + 1.0, IZ1 - 1.0, True),
+        ('X', X1, Y0 + WALL, Y1 - WALL, IZ0 + 1.0, IZ1 - 1.0, False),
+        ('Y', Y0, X0 + WALL, X1 - WALL, IZ0 + 1.0, IZ1 - 1.0, True),
+        ('Y', Y1, X0 + WALL, X1 - WALL, IZ0 + 1.0, IZ1 - 1.0, False),
+    ):
+        hc = honeycomb_on_side(
+            f"honey_{wall[0]}_{wall[1]:.0f}",
+            wall[0], wall[1], wall[4], wall[5], wall[2], wall[3],
+            side_excludes, HONEY_W / 2.0, HONEY_DEPTH, inward=wall[6])
+        if hc:
+            cutters.append(hc)
+
+    for c in cutters:
+        boolean(body, c, 'DIFFERENCE')
+
+    # --- ajouts positifs : colonnes de vissage -------------------------
+    # 4 colonnes Ø6 du fond (z=0) jusqu'à la butée des vis (Z1 - PCB_T).
+    # Légère sur-épaisseur (+0.5) pour garantir une union propre.
+    BOSS_TOP = (Z1 - PCB_T) + 0.5
+    feats = []
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cx = sx * SCREW_X
+            cy = sy * SCREW_Y
+            feats.append(cyl(f"boss_{sx}_{sy}", BOSS_D / 2.0,
+                             cx, cy, Z0, BOSS_TOP))
+
+    # --- ponts d'ancrage des colonnes ARRIÈRE ---------------------------
+    # La pastille cylindrique Ø6 flottait dans l'ouverture de la porte ; on
+    # la remplace par un pont rectangulaire qui s'étend jusqu'à la bande de
+    # fond plein arrière (y ≥ DOOR_OPEN_Y1) pour ancrer solidement les
+    # colonnes au corps. Le trou de vis Ø3.2 + fraisage Ø6×1 passent au travers.
+    for sx in (-1, 1):
+        cx = sx * SCREW_X
+        feats.append(box(f"rear_bridge_{sx}",
+                         cx - 2.75, cx + 2.75,
+                         SCREW_Y - 5.5, DOOR_OPEN_Y1,
+                         Z0, Z0 + 1.5))
+
+    for f in feats:
+        boolean(body, f, 'UNION')
+
+    # --- encoches pour les clips de la porte batterie -------------------
+    # Seuls les clips latéraux (y=+35) et les clips avant (face verticale de
+    # l'ouverture à y=DOOR_OPEN_Y0) sont conservés. Les clips arrière sont
+    # supprimés : le bord arrière de la porte ne touche plus le mur du fond.
+    detent_z = DOOR_LIP_H / 2.0
+    detents = []
+
+    # faces X latérales : encoches à y = +35
+    for sx in (-1, 1):
+        dy = D / 2.0 - LIP - 8.0
+        x_in = IX0 if sx < 0 else IX1
+        x_out = IX0 - DETENT_D if sx < 0 else IX1 + DETENT_D
+        detents.append(box(f"detent_x_{sx}",
+                           min(x_in, x_out), max(x_in, x_out),
+                           dy - DETENT_LEN / 2.0,
+                           dy + DETENT_LEN / 2.0,
+                           detent_z - DETENT_D / 2.0,
+                           detent_z + DETENT_D / 2.0))
+
+    # face verticale AVANT de l'ouverture : encoches à x=±20
+    for sx in (-1, 1):
+        bx = sx * 20.0
+        detents.append(box(f"detent_front_{sx}",
+                           bx - DETENT_LEN / 2.0, bx + DETENT_LEN / 2.0,
+                           DOOR_OPEN_Y0 - DETENT_D - 0.05, DOOR_OPEN_Y0 + 0.05,
+                           detent_z - DETENT_D / 2.0,
+                           detent_z + DETENT_D / 2.0))
+
+    for d in detents:
+        boolean(body, d, 'DIFFERENCE')
+
+    # --- perçage / fraisage final des vis (après union des colonnes) ---
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            cx = sx * SCREW_X
+            cy = sy * SCREW_Y
+            # trou traversant Ø3.2 (la vis s'arrête au PCB)
+            boolean(body, cyl(f"screw_hole_{sx}_{sy}",
+                              SCREW_CLEARANCE_D / 2.0,
+                              cx, cy, Z0 - 1.001, PCB_Z_TOP + 1.001, seg=32),
+                    'DIFFERENCE')
+            # fraisage tête de vis Ø6 x 1 mm côté extérieur
+            boolean(body, cyl(f"screw_csbore_{sx}_{sy}",
+                              SCREW_COUNTERBORE_D / 2.0,
+                              cx, cy, Z0 - 1.001,
+                              Z0 + SCREW_COUNTERBORE_DEPTH + 0.001, seg=32),
+                    'DIFFERENCE')
+            # dégagement 1 mm autour du trou côté support (PCB). Il ne doit
+            # PAS monter jusqu'au plafond, sinon il couperait la connexion
+            # entre la colonne et le corps.
+            boolean(body, cyl(f"boss_relief_{sx}_{sy}",
+                              BOSS_RELIEF_D / 2.0,
+                              cx, cy, PCB_Z_TOP - BOSS_RELIEF_DEPTH - 0.001,
+                              PCB_Z_TOP + 0.101, seg=32),
+                    'DIFFERENCE')
+
+    return body
+
+
+# =====================================================================
+#  BUILD: BATTERY DOOR
+# =====================================================================
+
+def build_door():
+    # Porte BATTERIE uniquement : couvre y +2.75..+46.25.
+    # La zone avant du fond (poche NFC + vis avant) reste pleine dans le corps.
+    hx = W / 2.0 - WALL - DOOR_CLEAR                # ±32.75, largeur intérieure
+    door_y0 = DOOR_OPEN_Y0 + DOOR_CLEAR             # 2.75
+    door_y1 = DOOR_OPEN_Y1 - DOOR_CLEAR             # 43.25
+
+    # Plaque principale : Z=-DOOR_T..0, coins arrondis SANS bevel.
+    # rounded_plate conserve le bbox exact (-hx..hx, door_y0..door_y1).
+    door = rounded_plate("battery_door", -hx, hx, door_y0, door_y1,
+                         -DOOR_T, 0.0, DOOR_R)
+
+    feats = []
+
+    # --- jupe périphérique (tube rectangulaire plein) -------------------
+    # Épaisseur 1 mm, hauteur DOOR_LIP_H, coins arrondis au même rayon.
+    # L'arrondi intérieur est réduit pour conserver une paroi d'épaisseur
+    # constante (1 mm) sans dépasser du rayon extérieur.
+    lip_thick = 1.0
+    lip_outer = rounded_plate("lip_outer", -hx, hx, door_y0, door_y1,
+                              0.0, DOOR_LIP_H, DOOR_R)
+    lip_inner = rounded_plate("lip_inner", -hx + lip_thick, hx - lip_thick,
+                              door_y0 + lip_thick, door_y1 - lip_thick,
+                              -0.1, DOOR_LIP_H + 0.1,
+                              max(DOOR_R - lip_thick, 0.1))
+    boolean(lip_outer, lip_inner, 'DIFFERENCE')
+    feats.append(lip_outer)
+
+    # --- clips de maintien ------------------------------------------------
+    # 2 clips latéraux (faces X, y=+35) + 2 clips avant (bord y=door_y0).
+    # Les clips arrière sont supprimés.
+    bump_z = DOOR_LIP_H / 2.0
+    for sx in (-1, 1):
+        # clip latéral
+        by = D / 2.0 - LIP - 8.0
+        x_edge = -hx if sx < 0 else hx
+        x_out = x_edge - DETENT_PROUD if sx < 0 else x_edge + DETENT_PROUD
+        feats.append(box(f"bump_x_{sx}",
+                         min(x_edge, x_out), max(x_edge, x_out),
+                         by - DETENT_LEN / 2.0,
+                         by + DETENT_LEN / 2.0,
+                         bump_z - DETENT_D / 2.0,
+                         bump_z + DETENT_D / 2.0))
+        # clip avant
+        bx = sx * 20.0
+        feats.append(box(f"bump_front_{sx}",
+                         bx - DETENT_LEN / 2.0, bx + DETENT_LEN / 2.0,
+                         door_y0 - DETENT_PROUD - 0.05, door_y0 + 0.05,
+                         bump_z - DETENT_D / 2.0,
+                         bump_z + DETENT_D / 2.0))
+
+    # --- nervures de maintien batterie ----------------------------------
+    # Cotes imposées par l'emboîtement : x ±25.3, y 6.7..41.8.
+    # La nervure arrière est BORNÉE au bord de la porte (door_y1).
+    rib_x0 = -25.3
+    rib_x1 = 25.3
+    rib_y0 = 6.7
+    rib_y1 = 41.8
+    rib_w = 1.5
+    rib_h = 2.0
+    feats.append(box("door_rib_x0", rib_x0 - rib_w, rib_x0, rib_y0, rib_y1,
+                     0.0, rib_h))
+    feats.append(box("door_rib_x1", rib_x1, rib_x1 + rib_w, rib_y0, rib_y1,
+                     0.0, rib_h))
+    feats.append(box("door_rib_y0", rib_x0, rib_x1, rib_y0 - rib_w, rib_y0,
+                     0.0, rib_h))
+    feats.append(box("door_rib_y1", rib_x0, rib_x1, rib_y1,
+                     min(rib_y1 + rib_w, door_y1), 0.0, rib_h))
+
+    for f in feats:
+        boolean(door, f, 'UNION')
+
+    # --- encoches pour les ponts d'ancrage arrière ----------------------
+    # Les ponts rectangulaires du corps (x=±26.75 ±2.75, y=37..46.5, z=0..1.5)
+    # montent dans l'ouverture de la porte. La jupe arrière et les nervures
+    # de la porte les recouvriraient : on découpe deux encoches rectangulaires
+    # autour de chaque pont (x 23.5..30.5, y 36..DOOR_Y1, z 0..4.1) pour
+    # garantir l'emboîtement sur toute la longueur du pont.
+    for sx in (-1, 1):
+        boolean(door, box(f"rear_bridge_notch_{sx}",
+                          23.5 if sx > 0 else -30.5,
+                          30.5 if sx > 0 else -23.5,
+                          36.0, door_y1,
+                          0.0, 4.1),
+                'DIFFERENCE')
+
+    # --- trous d'accès pour les vis M2.5 ARRIÈRE uniquement --------------
+    # Fraisage étagé : tête noyée Ø6.5 sur 1 mm côté extérieur (z=-2..-1),
+    # passage de tige Ø3.5 sur le reste (z=-1..0). Les vis AVANT sont dans
+    # le fond plein du corps : aucun trou avant sur la porte.
+    for sx in (-1, 1):
+        cx = sx * SCREW_X
+        cy = SCREW_Y
+        boolean(door, cyl(f"door_cbore_{sx}", 6.5 / 2.0,
+                          cx, cy, -DOOR_T - 0.101, -DOOR_T + 1.0, seg=32),
+                'DIFFERENCE')
+        boolean(door, cyl(f"door_clear_{sx}", 3.5 / 2.0,
+                          cx, cy, -DOOR_T + 1.0, 0.101, seg=32),
+                'DIFFERENCE')
+
+    return door
+
+
+# =====================================================================
+#  EXPORT / REPORT / RENDER
+# =====================================================================
+
+def export(ob, path):
+    bpy.ops.object.select_all(action='DESELECT')
+    ob.select_set(True)
+    bpy.context.view_layer.objects.active = ob
+    try:
+        bpy.ops.wm.stl_export(filepath=path, export_selected_objects=True,
+                              global_scale=1.0, ascii_format=False,
+                              apply_modifiers=True)
+    except AttributeError:
+        bpy.ops.export_mesh.stl(filepath=path, use_selection=True,
+                                global_scale=1.0)
+
+
+def report(ob, path):
+    lo, hi = bbox(ob)
+    print(f"[{ob.name}] {os.path.basename(path)}")
+    print(f"    bbox  X {lo.x:8.2f} .. {hi.x:8.2f}   ({hi.x - lo.x:6.2f} mm)")
+    print(f"    bbox  Y {lo.y:8.2f} .. {hi.y:8.2f}   ({hi.y - lo.y:6.2f} mm)")
+    print(f"    bbox  Z {lo.z:8.2f} .. {hi.z:8.2f}   ({hi.z - lo.z:6.2f} mm)")
+    print(f"    tris  {tri_count(ob)}")
+
+
+def preview():
+    sc = bpy.context.scene
+    sc.render.engine = 'BLENDER_WORKBENCH'
+    sc.render.resolution_x = 1280
+    sc.render.resolution_y = 960
+    cam_d = bpy.data.cameras.new("cam")
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 145
+    cam = bpy.data.objects.new("cam", cam_d)
+    bpy.context.collection.objects.link(cam)
+    sc.camera = cam
+    sc.display.shading.light = 'STUDIO'
+    sc.display.shading.show_cavity = True
+    tgt = Vector((0.0, 0.0, H / 2.0))
+
+    # 1. vue vendeur : écran à fleur + rebord + USB à l'arrière
+    cam.location = tgt + Vector((80.0, -95.0, 95.0))
+    cam.rotation_euler = (math.radians(60), 0, math.radians(35))
+    sc.render.filepath = os.path.join(OUT_DIR, "preview.png")
+    bpy.ops.render.render(write_still=True)
+
+    # 2. vue client : côté client / NFC (3/4 avant-bas)
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 145
+    cam.location = tgt + Vector((80.0, -120.0, 30.0))
+    cam.rotation_euler = (math.radians(70), 0, math.radians(25))
+    sc.render.filepath = os.path.join(OUT_DIR, "preview_front.png")
+    bpy.ops.render.render(write_still=True)
+
+    # 3. vue de profil montrant l'ensemble (corps + porte)
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 145
+    cam.location = tgt + Vector((120.0, 0.0, 55.0))
+    cam.rotation_euler = (math.radians(75), 0, math.radians(90))
+    sc.render.filepath = os.path.join(OUT_DIR, "preview_iso.png")
+    bpy.ops.render.render(write_still=True)
+
+    # 4. vue dessous : porte déjà positionnée à z=-2 sous le corps
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 140
+    cam.location = Vector((0.0, 0.0, -80.0))
+    cam.rotation_euler = (math.radians(180), 0, math.radians(180))
+    sc.render.filepath = os.path.join(OUT_DIR, "preview_bottom.png")
+    bpy.ops.render.render(write_still=True)
+
+
+def section_render(path):
+    sc = bpy.context.scene
+    sc.render.engine = 'BLENDER_WORKBENCH'
+    sc.render.resolution_x = 1200
+    sc.render.resolution_y = 900
+    cam_d = bpy.data.cameras.new("cam")
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 140
+    cam = bpy.data.objects.new("cam", cam_d)
+    bpy.context.collection.objects.link(cam)
+    sc.camera = cam
+    sc.display.shading.light = 'STUDIO'
+    sc.display.shading.show_cavity = True
+    cam.location = Vector((80.0, 0.0, H / 2.0))
+    cam.rotation_euler = (math.radians(90), 0, math.radians(90))
+    sc.render.filepath = path
+    bpy.ops.render.render(write_still=True)
+
+
+def main():
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    body = build_body()
+    door = build_door()
+
+    body_path = os.path.join(OUT_DIR, "body.stl")
+    door_path = os.path.join(OUT_DIR, "battery_door.stl")
+
+    print("\n================ LightningPoS enclosure v2 (FLAT) ================")
+    print(f"Enveloppe extérieure   W={W:.1f}  D={D:.1f}  H={H:.1f} mm")
+    print(f"Hauteur totale assise  {H + DOOR_T:.1f} mm (corps {H:.1f} + fond porte {DOOR_T:.1f})")
+    print(f"Écran actif            {SCREEN_AW:.1f} x {SCREEN_AL:.1f} mm²")
+    print(f"Poche cadre verre      {SCREEN_FRAME_W:.1f} x {SCREEN_FRAME_L:.1f} mm², "
+          f"profondeur {FRAME_DEPTH:.1f} mm (Z={FRAME_Z_BOT:.1f} .. {Z1:.1f})")
+    print(f"PCB (vissée)           {PCB_W:.1f} x {PCB_L:.1f} x {PCB_T:.1f} mm")
+    print(f"  - vis M{SCREW_D:.1f} aux coins, décal {SCREW_OFFSET:.1f} mm des bords")
+    print(f"  - trous traversants  Ø{SCREW_CLEARANCE_D:.1f}, "
+          f"X=±{SCREW_X:.1f}  Y=±{SCREW_Y:.1f}")
+    print(f"  - fraisage tête      Ø{SCREW_COUNTERBORE_D:.1f} x "
+          f"{SCREW_COUNTERBORE_DEPTH:.1f} mm")
+    print(f"  - dégagement PCB     Ø{BOSS_RELIEF_D:.1f} x {BOSS_RELIEF_DEPTH:.1f} mm")
+    print(f"NFC RC522              {NFC_W:.1f} x {NFC_L:.1f} x {NFC_T:.1f} mm")
+    print(f"  - position Y={NFC_Y:.1f}, plastique sous bobine = {NFC_SKIN:.1f} mm")
+    print(f"Batterie LiPo          {BAT_W:.1f} x {BAT_L:.1f} x {BAT_T:.1f} mm")
+    print(f"  - position Y={BAT_Y:.1f}")
+    print(f"USB-C                  arrière Y={USB_Y:.1f}, Z={USB_Z_BOT:.1f}..{USB_Z_TOP:.1f}")
+    print("------------------------------------------------------------")
+
+    export(body, body_path)
+    export(door, door_path)
+    report(body, body_path)
+    report(door, door_path)
+    print("============================================================\n")
+
+    argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    if "--section" in argv:
+        section_render(os.path.join(OUT_DIR, "section.png"))
+    if "--preview" in argv:
+        preview()
+
+
+if __name__ == "__main__":
+    main()

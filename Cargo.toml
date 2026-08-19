@@ -1,16 +1,15 @@
+# Workspace vide : le produit est `firmware-espidf/`, qui est un workspace
+# autonome (toolchain Xtensa + esp-idf-sys, incompatible avec les crates
+# `no_std` esp-hal ci-dessous). Les 9 crates historiques (variantes de cartes
+# abandonnées) ont été déplacées dans `archive/` et ne sont plus construites ;
+# `exclude` évite que cargo les réclame comme membres manquants.
+#
+# Les tables [workspace.package] et [workspace.dependencies] sont conservées :
+# elles ne coûtent rien et restent la référence des versions du code archivé.
 [workspace]
 resolver = "2"
-members = [
-    "lightningpos-core",
-    "lightningpos-hal",
-    "lightningpos-nfc",
-    "lightningpos-display",
-    "lightningpos-net",
-    "lightningpos-firmware",
-    "firmware-touch35",
-    "firmware-headless",
-    "firmware-c3",
-]
+members = []
+exclude = ["archive", "firmware-espidf"]
 
 [workspace.package]
 version = "0.1.0"
