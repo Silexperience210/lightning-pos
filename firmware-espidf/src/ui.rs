@@ -433,6 +433,7 @@ pub fn pay_screen(
     total_cents: u64,
     sats: u64,
     cur: &str,
+    receipt: &str,
 ) {
     const QR_TOP: usize = 88;
     const QR_MAX: usize = 268;
@@ -453,6 +454,12 @@ pub fn pay_screen(
     d.fill_round_rect_aa(qx - 6, qy - 6, total + 12, total + 12, 10.0, TXT);
     d.draw_qr(n, bits, qx + 2 * cell, qy + 2 * cell, cell, BG, TXT);
 
+    // Reçu compact du panier sous le QR (« BIERE x2, CAFE »).
+    let rw = Display::text_tracked_width(receipt, 1, 1);
+    if rw > 0 && rw <= SCREEN_W {
+        d.draw_text_tracked(receipt, (SCREEN_W - rw) / 2, 360, 1, 1, TXT_MUTED);
+    }
+
     // Invite NFC permanente (remplacée transitoirement par nfc_status).
     nfc_hint(d);
 
@@ -462,13 +469,20 @@ pub fn pay_screen(
     d.draw_text_tracked("ANNULER", 160 - w / 2, 439, 2, 3, ROSE);
 }
 
-/// Compte à rebours de la facture (pastille en haut à droite de l'écran QR).
+/// Compte à rebours de la facture : pastille « N s » (haut droite) + barre
+/// de progression ambre en haut de l'écran qui se vide avec la facture.
 /// Redessine par-dessus la valeur précédente — appelé à chaque poll.
-pub fn pay_countdown(d: &mut Display, secs: u64) {
+pub fn pay_countdown(d: &mut Display, secs: u64, total: u64) {
     let s = format!("{} s", secs);
     d.fill_round_rect_aa(232, 10, 80, 24, 12.0, BG);
     let w = Display::text_tracked_width(&s, 1, 2);
     d.draw_text_tracked(&s, 312 - w, 15, 1, 2, TXT_MUTED);
+    // Barre ambre pleine au démarrage, qui se vide au fil de la facture.
+    let frac = secs as f32 / total.max(1) as f32;
+    d.fill_rect(0, 0, SCREEN_W, 6, BG);
+    if frac > 0.02 {
+        d.fill_rect(0, 0, (SCREEN_W as f32 * frac) as usize, 6, AMBER);
+    }
 }
 
 /// Écran de fin non nominale (annulé / expiré / erreur).
@@ -563,8 +577,19 @@ fn paid_bolt(d: &mut Display, cx: f32, cy: f32, h: f32, breath: f32) {
     bolt::draw_solid(d.fb_mut(), SCREEN_W, SCREEN_H, cx, cy, h, GLOW_INNER, 255);
 }
 
-/// Séquence de confirmation : flash blanc 50 ms → éclair plein avec glow →
-/// onde de validation → texte → respiration douce. ~0,9 s au total.
+/// Particule de l'explosion PAYÉ (tableau fixe, pas d'allocation à chaud).
+struct Particle {
+    x: f32,
+    y: f32,
+    vx: f32,
+    vy: f32,
+    life: f32,
+    white: bool,
+}
+
+/// Séquence de confirmation cosmique : rotations 3D seedées → flash blanc
+/// 50 ms → onde de choc (3 anneaux) → bolt maître unique (seed = payment
+/// hash) → explosion de particules → texte → respiration douce. ~1,9 s.
 pub fn paid(d: &mut Display, total_cents: u64, cur: &str) {
     // Éclair 3D : 2 rotations rapides (visible aussi en paiement QR).
     let t0 = std::time::Instant::now();

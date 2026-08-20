@@ -348,7 +348,7 @@ fn poll_second_tap(touch: &mut Touch, ms: u64) -> bool {
     false
 }
 
-/// Boucle d'animation éclair jusqu'à un toucher ou `max_ms` écoulés.
+/// Attract animé (éclair 3D) jusqu'à un toucher ou `max_ms` écoulés.
 /// Retourne true si un toucher est survenu (le relâchement est drainé).
 fn attract_until_touch(display: &mut Display, touch: &mut Touch, max_ms: u64) -> bool {
     let start = Instant::now();
@@ -383,6 +383,36 @@ fn attract_until_touch(display: &mut Display, touch: &mut Touch, max_ms: u64) ->
             return false;
         }
     }
+}
+
+/// Reçu compact : « BIERE x2, CAFE, EAU x3 » — tronqué à ~40 caractères
+/// avec un « +N » si le panier est trop long. Montant libre → « MONTANT LIBRE ».
+fn build_receipt(products: &[store::Product], basket: &[u8]) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (i, &q) in basket.iter().enumerate() {
+        if q > 0 && i < products.len() {
+            if q > 1 {
+                parts.push(format!("{} x{}", products[i].name, q));
+            } else {
+                parts.push(products[i].name.clone());
+            }
+        }
+    }
+    if parts.is_empty() {
+        return "MONTANT LIBRE".to_string();
+    }
+    let mut s = String::new();
+    for (k, p) in parts.iter().enumerate() {
+        if k > 0 {
+            s.push_str(", ");
+        }
+        if s.len() + p.len() + 4 > 40 {
+            s.push_str(&format!("+{}", parts.len() - k));
+            break;
+        }
+        s.push_str(p);
+    }
+    s
 }
 
 /// Flux de paiement : €→sats → facture LNbits → QR + NFC (Bolt Card) → poll → PAYÉ / ANNULÉ.
@@ -440,7 +470,7 @@ fn pay(
                 }
             };
             // Écran QR : les deux unités (€ + sats) toujours visibles.
-            ui::pay_screen(display, n, &bits, total_cents, sats, &cur);
+            ui::pay_screen(display, n, &bits, total_cents, sats, &cur, label);
             display.flush();
             let mut paid = false;
             let mut cancelled = false;
@@ -466,7 +496,7 @@ fn pay(
             while Instant::now() < deadline {
                 // Compte à rebours de la facture (secondes restantes).
                 let remain = deadline.saturating_duration_since(Instant::now()).as_secs();
-                ui::pay_countdown(display, remain);
+                ui::pay_countdown(display, remain, INVOICE_TTL_SECS);
                 display.flush();
                 if cancel_pressed(touch) {
                     cancelled = true;
@@ -588,7 +618,6 @@ fn pay(
                 } else {
                     println!("[POS] transaction enregistrée ({total_cents} cents / {sats} sats)");
                 }
-                // Séquence PAYÉ : flash blanc 50 ms → éclair ≥ 380 px → respiration.
                 ui::paid(display, total_cents, &cur);
             } else if cancelled {
                 ui::status(display, "X", "ANNULE", "PAIEMENT ANNULE", ROSE);
@@ -821,6 +850,8 @@ fn main() {
     // Libellé du panier pour le journal : le premier article ajouté (le nombre
     // total d'articles est préfixé au moment de l'encaissement).
     let mut cart_label = String::new();
+    // Panier réel : quantité par produit (pour le reçu à l'écran et le journal).
+    let mut basket: [u8; store::NUM_PRODUCTS] = [0; store::NUM_PRODUCTS];
     let mut calc_mode = false;
     // État calculatrice
     let mut acc: f64 = 0.0;
@@ -1133,6 +1164,7 @@ fn main() {
                         let p = &products[base + slot];
                         total_cents += p.cents as u64;
                         items += 1;
+                        basket[base + slot] = basket[base + slot].saturating_add(1);
                         if cart_label.is_empty() {
                             cart_label = p.name.clone();
                         }
@@ -1142,13 +1174,9 @@ fn main() {
                         page = if page == 0 { 1 } else { 0 };
                     }
                     _ => {
-                        // Libellé du journal : « 3x BIERE » pour un panier
-                        // multi-articles, le nom seul pour un article unique.
-                        let label = if items > 1 {
-                            format!("{items}x {cart_label}")
-                        } else {
-                            cart_label.clone()
-                        };
+                        // Reçu : liste complète des articles (« BIERE x2, CAFE »)
+                        // pour l'écran de paiement ET le journal.
+                        let label = build_receipt(&products, &basket);
                         if pay(
                             &mut display,
                             &mut touch,
@@ -1160,6 +1188,7 @@ fn main() {
                             total_cents = 0;
                             items = 0;
                             cart_label.clear();
+                            basket = [0; store::NUM_PRODUCTS];
                             println!("[POS] vente encaissée, panier vidé");
                         }
                     }
