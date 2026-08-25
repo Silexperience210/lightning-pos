@@ -25,6 +25,7 @@ Toutes les cotes sont en millimètres (1 unité Blender = 1 mm).
 
 import math
 import os
+import subprocess
 import sys
 
 import bmesh
@@ -42,7 +43,7 @@ CLEAR = 0.3           # jeu FDM par face sur les cavités composants
 
 # ---- enveloppe extérieure --------------------------------------------
 LIP = 5.5             # marge plastique autour du PCB (détermine W/D)
-H = 22.0              # hauteur totale du corps (hors porte batterie)
+H = 29.0              # hauteur totale du corps (hors porte batterie)
 WALL = 2.0            # épaisseur des parois verticales
 TOP_WALL = 2.2        # épaisseur de la face supérieure (égale à FRAME_DEPTH)
 BOT_WALL = 1.5        # épaisseur de la face inférieure sous la bobine NFC
@@ -74,7 +75,8 @@ BOSS_RELIEF_DEPTH = 1.0  # profondeur dégagement côté PCB
 # ---- RC522 NFC -------------------------------------------------------
 NFC_W = 60.0          # largeur module (X)
 NFC_L = 40.0          # longueur module (Y)
-NFC_T = 3.0           # épaisseur module
+NFC_T = 4.0           # épaisseur module + COMPOSANTS (chip/pins) — les rails
+                      # doivent dégager l'encombrement réel, pas le PCB seul
 NFC_SKIN = 1.5        # plastique sous la bobine (≤ 1.5 mm)
 NFC_CLEAR = 0.5       # jeu supplémentaire autour du module
 
@@ -91,6 +93,7 @@ USB_H = 8.0           # hauteur ouverture (tolérant connecteur vertical)
 # ---- porte batterie --------------------------------------------------
 DOOR_T = 2.0          # épaisseur du fond de la porte
 DOOR_LIP_H = 4.0      # hauteur de la jupe périphérique qui rentre dans le corps
+DOOR_LIP_THICK = 1.5  # épaisseur de la jupe (A : 1,0 → 1,5 mm, corrige DfAM p05<1,2)
 DOOR_CLEAR = 0.35     # jeu entre porte et corps (PETG 0,3-0,5 % de retrait)
 
 # ---- guidage PCB -----------------------------------------------------
@@ -203,10 +206,16 @@ NFC_Z_CEIL = NFC_Z_FLOOR + NFC_T + NFC_CLEAR
 BAT_X = 0.0
 BAT_Y = (D / 2.0 - BAT_L / 2.0 - LIP - NFC_CLEAR) - 3.5
 
-#  USB-C : au milieu de l'arrière (Y positif)
-USB_Y = Y1
-USB_Z_BOT = PCB_Z_BOT - 1.0  # engloble le connecteur qui dépasse sous le PCB
-USB_Z_TOP = USB_Z_BOT + USB_H
+#  USB-C : connecteur VERTICAL (axe perpendiculaire au PCB), au MILIEU de
+#  la carte — le câble se branche par le DESSOUS. Le boîtier a donc un
+#  trou dans la FACE INFÉRIEURE au centre (x=0, y=0) + une poche pour le
+#  corps du connecteur sous le PCB.
+USB_X = 0.0
+USB_Y = 0.0
+USB_W = 12.0          # largeur du passage (X) — connecteur + câble
+USB_H = 14.0          # longueur du passage (Y) — connecteur + câble
+USB_Z_BOT = Z0 - 0.1  # traverse la face inférieure
+USB_Z_TOP = PCB_Z_BOT + 5.0  # poche du corps du connecteur + fiche (sous le PCB)
 
 # =====================================================================
 #  MESH HELPERS
@@ -545,11 +554,49 @@ def honeycomb_on_side(name, axis, fixed, z0, z1, t0, t1,
 #  BUILD: BODY
 # =====================================================================
 
+def rim_bevel(ob, z_rims, radius=1.8, segments=3):
+    """Arrondit les arêtes du pourtour extérieur (haut/bas) du corps.
+
+    Sélectionne les arêtes horizontales aux cotes `z_rims` dont le milieu est
+    sur le profil extérieur (max(|x|,|y|) >= 33.5) et hors de l'ouverture de
+    la porte batterie — les arêtes internes (cavité, poches, porte) restent
+    vives pour ne pas gêner l'assemblage.
+    """
+    import bmesh
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    for e in bm.edges:
+        v0, v1 = e.verts
+        if abs(v0.co.z - v1.co.z) > 0.01:
+            continue
+        z = v0.co.z
+        if not any(abs(z - zr) < 0.5 for zr in z_rims):
+            continue
+        mx = (v0.co.x + v1.co.x) / 2.0
+        my = (v0.co.y + v1.co.y) / 2.0
+        outer = max(abs(mx), abs(my)) >= 33.5
+        in_door = abs(mx) <= 33.5 and 2.5 <= my <= 47.0
+        if outer and not in_door:
+            e.select = True
+    bmesh.ops.bevel(bm, geom=[e for e in bm.edges if e.select],
+                    offset=radius, segments=segments, profile=0.5)
+    # nettoyage post-bevel : le bevel crée des doublons/dégénérés qui
+    # polluent le maillage (slicer + fichiers gonflés).
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    bmesh.ops.dissolve_degenerate(bm, dist=0.0001)
+    bm.to_mesh(ob.data)
+    bm.free()
+
+
 def build_body():
     # --- coque extérieure (coins arrondis SANS bevel : le haut doit rester
     # plat pour recevoir la plaque — rounded_box bevelait le rebord et le
     # plateau n'aurait plus eu d'appui) ---------------------------------
     body = rounded_plate("body", X0, X1, Y0, Y1, Z0, Z1_BODY, FILLET)
+    # Arrondi des bordures AVANT les découpes : le bevel sur la coque simple
+    # reste propre (peu de faces) ; les booléens internes (cavité, poches,
+    # porte) ne touchent pas le pourtour — le bevel survit sans explosion.
+    rim_bevel(body, [Z0, Z1_BODY], radius=1.8, segments=3)
 
     cutters = []
 
@@ -581,16 +628,16 @@ def build_body():
                     DOOR_OPEN_Y0, DOOR_OPEN_Y1, Z0 - 0.1, DOOR_LIP_H)
     cutters.append(door_open)
 
-    # --- encoche USB-C sur l'arrière ------------------------------------
-    cutters.append(box("usb", -USB_W / 2.0, USB_W / 2.0,
-                       Y1 - WALL - 0.1, Y1 + 2.0,
+    # --- passage USB-C dans la FACE INFÉRIEURE (connecteur vertical) -----
+    # Trou au centre (milieu de la carte) : traverse le fond + poche pour le
+    # corps du connecteur sous le PCB (le câble se branche par le dessous).
+    cutters.append(box("usb", USB_X - USB_W / 2.0, USB_X + USB_W / 2.0,
+                       USB_Y - USB_H / 2.0, USB_Y + USB_H / 2.0,
                        USB_Z_BOT, USB_Z_TOP))
 
     # --- texture honeycomb sur les 4 faces verticales -------------------
     # (plus de face supérieure : le toit est la plaque amovible)
-    side_excludes = [
-        (-USB_W / 2.0 - 2.0, USB_W / 2.0 + 2.0, USB_Z_BOT - 2.0, USB_Z_TOP + 2.0),
-    ]
+    side_excludes = []
     for sx in (-1, 1):
         for sy in (-1, 1):
             side_excludes.append((
@@ -635,6 +682,23 @@ def build_body():
                          cx - 2.75, cx + 2.75,
                          SCREW_Y - 5.5, DOOR_OPEN_Y1,
                          Z0, Z0 + 1.5))
+
+    # --- rails de retenue du module RC522 (logement à glissière) --------
+    # Le module (60×40×3) s'insère dans la poche par l'avant puis se glisse
+    # vers l'arrière SOUS les rails (glissière), le butoir = la paroi arrière
+    # de la poche. Les rails coiffent les bords X du module (~0.2 mm de jeu
+    # vertical) : le module reste en place SANS colle. L'avant (y < ny0+18)
+    # reste libre pour l'insertion + le passage des fils du header.
+    RAIL_W = 2.5          # largeur du rail (X)
+    RAIL_T = 1.2          # épaisseur du rail (Z)
+    RAIL_INSERT_FROM = 18.0   # insertion par l'avant sur 18 mm
+    RAIL_TO_BACK = 1.5        # marge avant le butoir arrière
+    for sx in (-1, 1):
+        rx0 = nx0 - 0.3 if sx == -1 else nx1 - RAIL_W + 0.3
+        feats.append(box(f"rc522_rail_{sx}", rx0, rx0 + RAIL_W,
+                         ny0 + RAIL_INSERT_FROM, ny1 - RAIL_TO_BACK,
+                         NFC_Z_FLOOR + NFC_T + 0.2,
+                         NFC_Z_FLOOR + NFC_T + 0.2 + RAIL_T))
 
     for f in feats:
         boolean(body, f, 'UNION')
@@ -689,7 +753,43 @@ def build_body():
                               Z0 + SCREW_COUNTERBORE_DEPTH + 0.001, seg=32),
                     'DIFFERENCE')
 
+    # nettoyage final : les booléens sur la coque bevelée laissent des
+    # faces dupliquées/dégénérées qui polluent le maillage (slicer).
+    cleanup_mesh(body)
     return body
+
+
+def cleanup_mesh(ob):
+    """Retire les faces dupliquées, les arêtes nues et les doublons.
+
+    Deux passes : la clé des faces dupliquées est basée sur les POSITIONS
+    des sommets (les booléens créent des coïncidences à index différents).
+    """
+    import bmesh
+    from collections import defaultdict
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    removed = 0
+    for _ in range(2):
+        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.001)
+        bmesh.ops.dissolve_degenerate(bm, dist=0.001)
+        seen = defaultdict(list)
+        for f in bm.faces:
+            key = tuple(sorted((round(v.co.x, 4), round(v.co.y, 4),
+                                round(v.co.z, 4)) for v in f.verts))
+            seen[key].append(f)
+        removed = 0
+        for faces in seen.values():
+            for f in faces[1:]:
+                bm.faces.remove(f)
+                removed += 1
+        if not removed:
+            break
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces)
+    bm.to_mesh(ob.data)
+    bm.free()
+    if removed:
+        print(f"[cleanup_mesh] {removed} faces dupliquées retirées")
 
 
 # =====================================================================
@@ -711,10 +811,11 @@ def build_door():
     feats = []
 
     # --- jupe périphérique (tube rectangulaire plein) -------------------
-    # Épaisseur 1 mm, hauteur DOOR_LIP_H, coins arrondis au même rayon.
+    # Épaisseur DOOR_LIP_THICK (1,5 mm — le DfAM signalait p05=1,0 sous la
+    # limite FDM 1,2), hauteur DOOR_LIP_H, coins arrondis au même rayon.
     # L'arrondi intérieur est réduit pour conserver une paroi d'épaisseur
-    # constante (1 mm) sans dépasser du rayon extérieur.
-    lip_thick = 1.0
+    # constante sans dépasser du rayon extérieur.
+    lip_thick = DOOR_LIP_THICK
     lip_outer = rounded_plate("lip_outer", -hx, hx, door_y0, door_y1,
                               0.0, DOOR_LIP_H, DOOR_R)
     lip_inner = rounded_plate("lip_inner", -hx + lip_thick, hx - lip_thick,
@@ -723,6 +824,13 @@ def build_door():
                               max(DOOR_R - lip_thick, 0.1))
     boolean(lip_outer, lip_inner, 'DIFFERENCE')
     feats.append(lip_outer)
+
+    # --- chanfrein d'entrée 45° sur le haut de la jupe -------------------
+    # La porte s'engage en douceur dans l'ouverture du corps sans forcer
+    # sur les clips (qualité d'assemblage pro).
+    boolean(door, chamfer_top_rect("door_lip_chamfer",
+                                   -hx, hx, door_y0, door_y1,
+                                   DOOR_LIP_H, 0.6, 0.6), 'DIFFERENCE')
 
     # --- clips de maintien ------------------------------------------------
     # 2 clips latéraux (faces X, y=+35) + 2 clips avant (bord y=door_y0).
@@ -765,6 +873,18 @@ def build_door():
     feats.append(box("door_rib_y1", rib_x0, rib_x1, rib_y1,
                      min(rib_y1 + rib_w, door_y1), 0.0, rib_h))
 
+    # --- croix de renfort centrale (B) -----------------------------------
+    # Deux nervures croisées sous la grande surface plate de la porte :
+    # rigidité anti-flexion sans épaissir le fond (la face extérieure reste
+    # plane pour reposer à plat). Ne gêne ni la batterie (au-dessus) ni les
+    # clips (aux bords).
+    rib_mid_y = (rib_y0 + rib_y1) / 2.0
+    feats.append(box("door_rib_cross_x", -rib_w / 2.0, rib_w / 2.0,
+                     rib_y0, rib_y1, 0.0, rib_h))
+    feats.append(box("door_rib_cross_y", rib_x0, rib_x1,
+                     rib_mid_y - rib_w / 2.0, rib_mid_y + rib_w / 2.0,
+                     0.0, rib_h))
+
     for f in feats:
         boolean(door, f, 'UNION')
 
@@ -796,6 +916,21 @@ def build_door():
                           cx, cy, -DOOR_T + 1.0, 0.101, seg=32),
                 'DIFFERENCE')
 
+    # --- éclair ⚡ gravé en creux (signature visuelle) --------------------
+    # Gravé de 0,35 mm sur la face extérieure de la porte, centré entre les
+    # deux vis arrière. La face intérieure (nervures + appui batterie) reste
+    # intacte. Discrétion : petite taille, profondeur faible.
+    bolt_cy = (door_y0 + door_y1) / 2.0
+    boolean(door, lightning_bolt("door_bolt", 0.0, bolt_cy,
+                                 -DOOR_T, 5.0, 0.35), 'DIFFERENCE')
+
+    # --- encoche doigt (ouverture sans outil) ----------------------------
+    # Petite échancrure au bord arrière (côté vis), centrée : on y glisse un
+    # ongle pour déclipser la porte. Ne traverse pas (profondeur 1,2 mm).
+    boolean(door, box("door_thumb", -6.0, 6.0,
+                      door_y1 - 0.4, door_y1 + 1.6,
+                      -DOOR_T - 0.101, -DOOR_T + 1.2), 'DIFFERENCE')
+
     return door
 
 
@@ -814,11 +949,12 @@ def build_top_plate():
     plate = rounded_plate("top_plate", X0, X1, Y0, Y1,
                           Z1_BODY, Z1, FILLET)
 
-    # --- poche verre TRAVERSANTE 63,5×95,5 (coins arrondis r4) ----------
+    # --- poche verre TRAVERSANTE 63,5×95,5 (coins arrondis r5) ----------
     # Aucun fond : le verre remplit la poche à fleur, le panneau/LCD pend
     # sous la plaque dans la cavité (c'est ce qui rend l'assemblage possible).
+    # Rayon 5.0 = l'arrondi RÉEL des coins de l'écran JC3248W535C.
     boolean(plate, rounded_plate("plate_hole", FX0, FX1, FY0, FY1,
-                                 Z1_BODY - 0.1, Z1 + 0.1, 4.0), 'DIFFERENCE')
+                                 Z1_BODY - 0.1, Z1 + 0.1, 5.0), 'DIFFERENCE')
 
     # --- 4 bossages taraudés Ø6 sous la plaque (±26.75, ±42.5) ----------
     # Les bossages sont SOUS le trou verre (la plaque y est absente) : on les
@@ -876,6 +1012,46 @@ def report(ob, path):
     print(f"    tris  {tri_count(ob)}")
 
 
+def dfam_check(path):
+    """Lance l'analyse DfAM (murs/surplombs/orientation) sur un STL exporté.
+
+    Utilise le venv dédié ~/.hermes/venvs/dfam (trimesh) — le même que le skill
+    Hermes dfam-check. N'échoue JAMAIS la génération : un souci DfAM s'imprime
+    comme avertissement, la pièce reste générée pour inspection visuelle.
+    """
+    try:
+        py = os.path.expanduser("~/.hermes/venvs/dfam/bin/python")
+        tool = os.path.expanduser(
+            "~/.hermes/skills/3d-printing/dfam-check/scripts/dfam_tool.py")
+        if not (os.path.exists(py) and os.path.exists(tool)):
+            print("    DfAM: outil indisponible (venv/skill manquant) — ignoré")
+            return
+        import json
+        raw = subprocess.run(
+            [py, tool, "measure", path, "--angle-limit", "45"],
+            capture_output=True, text=True, timeout=120)
+        if raw.returncode != 0:
+            print(f"    DfAM: échec ({raw.stderr.strip()[-120:]}) — ignoré")
+            return
+        d = json.loads(raw.stdout)
+        mesh = d.get("mesh", {})
+        walls = d.get("wall_thickness", {})
+        over = d.get("overhangs", {})
+        wt = mesh.get("watertight")
+        wt_txt = "OK" if wt else "non fermé (normal pour pièce assemblée)"
+        print(f"    DfAM  watertight {wt_txt} | {mesh.get('triangle_count', '?')} tris | "
+              f"{mesh.get('body_count', '?')} corps")
+        if walls:
+            print(f"    DfAM  murs: min {walls.get('min_mm')} mm | p05 {walls.get('p05_mm')} mm | "
+                  f"médiane {walls.get('median_mm')} mm (FDM ≥1,2)")
+        if over:
+            pct = over.get("down_facing_area_below_limit_pct")
+            print(f"    DfAM  surplombs <45°: {over.get('down_facing_area_below_limit_mm2')} mm² "
+                  f"({pct}%)")
+    except Exception as exc:
+        print(f"    DfAM: erreur ({exc}) — ignoré")
+
+
 def preview():
     sc = bpy.context.scene
     sc.render.engine = 'BLENDER_WORKBENCH'
@@ -921,6 +1097,14 @@ def preview():
     sc.render.filepath = os.path.join(OUT_DIR, "preview_bottom.png")
     bpy.ops.render.render(write_still=True)
 
+    # 5. vue de DESSUS : la plaque + la fenêtre écran (r5)
+    cam_d.type = 'ORTHO'
+    cam_d.ortho_scale = 130
+    cam.location = Vector((0.0, 0.0, 80.0))
+    cam.rotation_euler = (0, 0, 0)
+    sc.render.filepath = os.path.join(OUT_DIR, "preview_top.png")
+    bpy.ops.render.render(write_still=True)
+
 
 def section_render(path):
     sc = bpy.context.scene
@@ -946,7 +1130,9 @@ def main():
 
     body = build_body()
     door = build_door()
+    cleanup_mesh(door)
     plate = build_top_plate()
+    cleanup_mesh(plate)
 
     body_path = os.path.join(OUT_DIR, "body.stl")
     door_path = os.path.join(OUT_DIR, "battery_door.stl")
@@ -973,6 +1159,10 @@ def main():
     report(body, body_path)
     report(door, door_path)
     report(plate, plate_path)
+    print("    --- analyse DfAM (murs / surplombs / étanchéité) ---")
+    dfam_check(body_path)
+    dfam_check(door_path)
+    dfam_check(plate_path)
     print("============================================================\n")
 
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []

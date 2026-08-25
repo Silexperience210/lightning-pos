@@ -56,6 +56,28 @@ Rounded corners, 5 mm plastic margin around the PCB.
 | `NFC_SKIN` | plastic under the NFC coil (≤ 1.5 mm). |
 | `CLEAR` | per-side clearance on component pockets. |
 
+### DfAM check (automatic)
+
+Every `gen_v2.py` run now prints a **DfAM analysis** per exported part right
+after the bbox report — wall thickness (min / p05 / median), overhangs < 45°,
+watertightness. It uses the Hermes skill `dfam-check`
+(`~/.hermes/venvs/dfam` + `~/.hermes/skills/3d-printing/dfam-check`); a
+missing tool degrades to a note, it never fails the build.
+
+Standalone check of any STL:
+
+    dfam-check.sh <file.stl> [--angle-limit 45] [--orientations]
+
+**Open findings (2026-08-25):**
+
+- **`battery_door.stl` — wall p05 = 1.0 mm** (limit FDM ≥ 1.2 mm supported /
+  ≥ 1.6 mm unsupported). The door's thin walls should be thickened ~0.5 mm on
+  the next design pass; print with 4 perimeters meanwhile.
+- `body.stl` reports `watertight: false` — **expected**: it is an open shell
+  (the top plate closes it). Not a defect. Reference: Blender
+  `check_watertight.py` reports 0 non-manifold edges.
+- `top_plate.stl` is watertight, single body — good.
+
 ---
 
 ## v1 — Wedge terminal (legacy)
