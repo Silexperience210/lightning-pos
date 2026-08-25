@@ -926,9 +926,11 @@ def build_door():
 
     # --- encoche doigt (ouverture sans outil) ----------------------------
     # Petite échancrure au bord arrière (côté vis), centrée : on y glisse un
-    # ongle pour déclipser la porte. Ne traverse pas (profondeur 1,2 mm).
+    # ongle pour déclipser la porte. Reste DANS l'épaisseur de la porte
+    # (déborde de 0,3 mm seulement) — un débord de 1,6 mm créait un trou
+    # visible entre la porte et le corps à l'assemblage.
     boolean(door, box("door_thumb", -6.0, 6.0,
-                      door_y1 - 0.4, door_y1 + 1.6,
+                      door_y1 - 1.6, door_y1 + 0.3,
                       -DOOR_T - 0.101, -DOOR_T + 1.2), 'DIFFERENCE')
 
     return door
